@@ -175,7 +175,7 @@ So two of my three proposed pillars didn't ship under their proposed names. That
 
 ---
 
-## The trail
+## The trail — this project
 
 | PR | What | Diff | State |
 |---|---|---:|---|
@@ -199,7 +199,184 @@ Two enabling PRs came out of review pressure and are worth a note, because neith
 
 The bigger change also came from review. The example originally read `Tram._brake_point.set_limit(self, brake_at); Tram._cruise.rearm(self)` and Jan asked, reasonably, what was going on there. Letting `limit` accept an `Observable` and having `bind()` subscribe to *its* `CHANGED` signal deleted `set_limit()`, `rearm()` and three more methods, and collapsed those three calls into one assignment. It also deleted the entire class of bug where a model forgets to re-arm and the threshold silently never fires again. Smaller API, fewer ways to hold it wrong — and it wasn't my idea first.
 
-Full history, if you want to check the rest: [64 PRs opened, 48 merged](https://github.com/mesa/mesa/pulls?q=is%3Apr+author%3Acodebreaker32) since December 2025. Before the coding period I'd also [reviewed 17 PRs](https://github.com/mesa/mesa/pulls?q=is%3Apr+reviewed-by%3Acodebreaker32+-author%3Acodebreaker32) by other people and opened 14 issues.
+---
+
+## The tracking issue
+
+The action half of this project is tracked in **[issue #3798](https://github.com/mesa/mesa/issues/3798)**, which I opened on 13 August. It's a status document rather than a discussion — five sections, fourteen checkboxes, and it says plainly which are done and which aren't.
+
+| Section | What it covers | Status |
+|---|---|---|
+| 1. Event list — `mesa.time` | Adaptive compaction, tombstone counter, O(1) `__len__` | Done — [#3800](https://github.com/mesa/mesa/pull/3800) |
+| 2. Action primitives | Requirement lists, `ActionState.FAILED` and `on_fail()`, give `priority` an effect | Done — [#3801](https://github.com/mesa/mesa/pull/3801), [#3805](https://github.com/mesa/mesa/pull/3805) |
+| 3. Wake contract | `Agent.on_idle`, deferred `Priority.LOW` dispatch, same-time coalescing, cancel the wake on `Agent.remove()` | Written, awaiting review — [#3833](https://github.com/mesa/mesa/pull/3833) |
+| 4. Preemption | `Agent.should_interrupt`, consulted by `interrupt_for()` | Done — [#3805](https://github.com/mesa/mesa/pull/3805) |
+| 5. Docs and examples | Document both wake sources, user-space "resume the remainder" recipes, a task-driven example | **Not started** |
+
+Seven of the fourteen boxes are ticked. The issue also carries the two design questions I couldn't settle on my own — whether an agent should have exactly one action slot, and whether the whole action cluster belongs on core `Agent` or behind an experimental mixin — recorded as open decisions rather than quietly resolved in a direction nobody agreed to.
+
+I'd opened one tracking issue before, [#3209](https://github.com/mesa/mesa/issues/3209), for the `AgentSet` refactor in January. Splitting a design across several PRs and keeping the status in one public place worked well enough there that I did it again.
+
+---
+
+## Everything else I've done in Mesa
+
+This project isn't where I started. My first PR merged on 18 December 2025, three months before GSoC applications opened, and by the time coding began I'd already spent five months in the parts of the codebase this project depends on. That mattered more than the proposal did.
+
+**64 pull requests opened, 48 merged** — +7,518 / −2,115 lines across the merged ones. Between December and May, Mesa merged 268 PRs from all authors; 38 of them were mine, the second-highest count in the repository over that window.
+
+The thirteen above are the GSoC project. Here is the rest, grouped by what it touched.
+
+### Reactive signals — `mesa_signals`
+
+The observable/computed layer the continuous-state work is built on. I spent the winter fixing and speeding it up, which is the only reason I knew it well enough to build on it later.
+
+| PR | Title | Diff | State |
+|---|---|---:|---|
+| [#3153](https://github.com/mesa/mesa/pull/3153) | Replace Computable Descriptor with @computed in mesa_signals | +225 / −146 | merged |
+| [#3198](https://github.com/mesa/mesa/pull/3198) | Optimise mesa_signals by skipping signals for empty subscribers to reduce subsequent overheads | +73 / −37 | merged |
+| [#3255](https://github.com/mesa/mesa/pull/3255) | Fix docstring in `mesa_signals/core.py` | +3 / −2 | merged |
+| [#3462](https://github.com/mesa/mesa/pull/3462) | Add static dependency injection to `@computed_property` for `@emit` support | +163 / −42 | merged |
+| [#3486](https://github.com/mesa/mesa/pull/3486) | Fixes a cache-invalidation bug for `SignalingList` | +43 / −5 | merged |
+
+### Agent storage — `AgentSet`
+
+Mesa held its agents in weak-referenced sets, which cost lookup time on the hottest path in the framework. This introduced an abstract base and a strong-keyed variant underneath it, then switched `Model` over. Tracked in issue #3209.
+
+| PR | Title | Diff | State |
+|---|---|---:|---|
+| [#3160](https://github.com/mesa/mesa/pull/3160) | Introducing _StrongAgentSet to support strong references in agents.py | +367 / −9 | closed |
+| [#3163](https://github.com/mesa/mesa/pull/3163) | Optimise create_agents by replacing 'ListLike' approach with itertools | +40 / −27 | merged |
+| [#3210](https://github.com/mesa/mesa/pull/3210) | Introduce AbstractAgentSet to agent.py and refactor AgentSet to inherit from it | +312 / −210 | merged |
+| [#3219](https://github.com/mesa/mesa/pull/3219) | Introduce `_HardKeyAgentSet` in agents.py | +398 / −16 | merged |
+| [#3224](https://github.com/mesa/mesa/pull/3224) | Update `model.py` to replace `AgentSet` with `_HardKeyAgentSet` | +54 / −19 | merged |
+| [#3448](https://github.com/mesa/mesa/pull/3448) | Micro-optimisations in agent and agentset | +10 / −10 | closed |
+
+### Data collection — `DataRecorder`
+
+A reactive alternative to the legacy `DataCollector`: datasets that subscribe to signals instead of being polled once per step, with memory, JSON, parquet and SQL backends. The single largest thing I've added to Mesa.
+
+| PR | Title | Diff | State |
+|---|---|---:|---|
+| [#3109](https://github.com/mesa/mesa/pull/3109) | Fix batch_run Data Collection to Ensure Accuracy and Capture All Steps | +139 / −8 | merged |
+| [#3145](https://github.com/mesa/mesa/pull/3145) | Add `DataRecorder` for reactive Data Storage and `DatasetConfig` for Configuration | +1,821 / −0 | merged |
+| [#3299](https://github.com/mesa/mesa/pull/3299) | Resolve `DataRecorder` off-by-one timestamp error | +1 / −1 | merged |
+| [#3408](https://github.com/mesa/mesa/pull/3408) | Add time column to empty dataframe in `datarecorder` | +3 / −5 | merged |
+| [#3424](https://github.com/mesa/mesa/pull/3424) | Add explicit `RUN_ENDED` signal for terminal data handling in `DataRecorder` | +129 / −29 | merged |
+| [#3579](https://github.com/mesa/mesa/pull/3579) | Fix empty batch_run results when model_reporters is None | +38 / −2 | merged |
+
+### Discrete spaces and the removal of `PropertyLayer`
+
+`PropertyLayer` was a wrapper class around what was already a NumPy array. Four PRs replaced it with the array itself and then deleted the module, net −536 lines. Separately, cells learned to distinguish their logical index from their physical position, which is what made network layouts drawable.
+
+| PR | Title | Diff | State |
+|---|---|---:|---|
+| [#3074](https://github.com/mesa/mesa/pull/3074) | Refactor PropertyLayer to implement NumPy interface | +18 / −35 | merged |
+| [#3080](https://github.com/mesa/mesa/pull/3080) | Enforce read-only safety for 'empty' layer | +54 / −6 | closed |
+| [#3087](https://github.com/mesa/mesa/pull/3087) | Optimise select_random_empty_cell() in grid.py | +39 / −6 | merged |
+| [#3096](https://github.com/mesa/mesa/pull/3096) | Add HexGridMovingAgent to cell_agent | +107 / −3 | merged |
+| [#3268](https://github.com/mesa/mesa/pull/3268) | Distinguish Logical Index from Physical Position | +408 / −19 | merged |
+| [#3340](https://github.com/mesa/mesa/pull/3340) | Remove PropertyLayer and HasPropertyLayers mixin  | +410 / −516 | merged |
+| [#3355](https://github.com/mesa/mesa/pull/3355) | Enforce default physical layout for Network spaces | +8 / −18 | merged |
+| [#3387](https://github.com/mesa/mesa/pull/3387) | Convert DiscreteSpace to an Abstract Base Class | +14 / −10 | merged |
+| [#3432](https://github.com/mesa/mesa/pull/3432) | Delete property_layer.py | +0 / −446 | merged |
+
+### Continuous space
+
+Allocation and removal on the hot path, plus two attempts at pathfinding over stacked spaces that I did not land.
+
+| PR | Title | Diff | State |
+|---|---|---:|---|
+| [#3491](https://github.com/mesa/mesa/pull/3491) | Optimise `_remove_agent` in Continuous Space | +28 / −30 | merged |
+| [#3537](https://github.com/mesa/mesa/pull/3537) | pathfinding for stacked space | +171 / −7 | closed |
+| [#3556](https://github.com/mesa/mesa/pull/3556) | Refactor _add_agent in ContinuousSpace | +11 / −11 | merged |
+| [#3678](https://github.com/mesa/mesa/pull/3678) | Pathfinding for Stacked Space | +180 / −7 | closed |
+
+### Visualisation
+
+Mostly consequences of the space work above — drawers and the network renderer had to follow the cell-position change.
+
+| PR | Title | Diff | State |
+|---|---|---:|---|
+| [#3059](https://github.com/mesa/mesa/pull/3059) | Minor Refactoring in solara_viz | +3 / −4 | merged |
+| [#3065](https://github.com/mesa/mesa/pull/3065) | Fix race around condition in space_renderer | +17 / −8 | closed |
+| [#3323](https://github.com/mesa/mesa/pull/3323) | Modify Space Drawers to use explicit Cell positions | +18 / −20 | merged |
+| [#3344](https://github.com/mesa/mesa/pull/3344) | Remove `model.steps` usage from solara_viz | +1 / −1 | merged |
+| [#3345](https://github.com/mesa/mesa/pull/3345) | Update `Network` to use `Cell.position` and `layout` for Visualisation | +37 / −180 | merged |
+
+### Benchmarks
+
+The harness compares timings across commits, so it has to be trustworthy before anything else is. Warm-up runs, `gc` disabled around the timed loop, and every example moved onto `Scenario`.
+
+| PR | Title | Diff | State |
+|---|---|---:|---|
+| [#3177](https://github.com/mesa/mesa/pull/3177) | Fix typo in configurations.py | +1 / −1 | merged |
+| [#3203](https://github.com/mesa/mesa/pull/3203) | Make benchmarking more robust | +21 / −5 | merged |
+| [#3314](https://github.com/mesa/mesa/pull/3314) | Use scenario for all examples in benchmarks | +209 / −126 | merged |
+
+### Core correctness and cleanup
+
+Reproducibility and lifecycle bugs, mostly found while doing something else.
+
+| PR | Title | Diff | State |
+|---|---|---:|---|
+| [#2978](https://github.com/mesa/mesa/pull/2978) | Fix reproducibility warnings by adding explicit random parameters | +15 / −10 | merged |
+| [#3036](https://github.com/mesa/mesa/pull/3036) | Add initialization check in Simulator.run_for() | +23 / −5 | merged |
+| [#3192](https://github.com/mesa/mesa/pull/3192) | Fix seed logic to ensure reproducibility | +30 / −3 | merged |
+| [#3298](https://github.com/mesa/mesa/pull/3298) | Revert "Add a signal at start of run (#3284)" | +1 / −5 | merged |
+| [#3335](https://github.com/mesa/mesa/pull/3335) | Remove additional lines of code used for testing | +0 / −5 | merged |
+
+### Docs and navigation
+
+Small but they were broken.
+
+| PR | Title | Diff | State |
+|---|---|---:|---|
+| [#2938](https://github.com/mesa/mesa/pull/2938) | Fix Navigation Issue | +4 / −4 | merged |
+| [#2970](https://github.com/mesa/mesa/pull/2970) | Support capacity-aware cell selection | +47 / −25 | closed |
+| [#3723](https://github.com/mesa/mesa/pull/3723) | Testing RTD Dropdown Fix | +4 / −4 | closed |
+
+### Closed without merging — early proposals
+
+My first weeks. An exception hierarchy proposed twice and declined, two example models that did not fit the examples policy, and one branch pushed under a placeholder title. Listed because leaving them out would misrepresent the ratio.
+
+| PR | Title | Diff | State |
+|---|---|---:|---|
+| [#2991](https://github.com/mesa/mesa/pull/2991) | Feat: Introduce dedicated exception hierarchy in mesa/errors.py | +146 / −10 | closed |
+| [#2992](https://github.com/mesa/mesa/pull/2992) | Feat: Introduce dedicated exception hierarchy in mesa/errors.py  | +191 / −0 | closed |
+| [#3040](https://github.com/mesa/mesa/pull/3040) | Add new example to MESA advanced examples | +334 / −0 | closed |
+| [#3050](https://github.com/mesa/mesa/pull/3050) | Add Emperor's Dilemma to mesa-examples | +327 / −0 | closed |
+| [#3589](https://github.com/mesa/mesa/pull/3589) | check | +392 / −0 | closed |
+
+---
+
+## Issues and reviews
+
+Fifteen issues opened, fourteen of them closed:
+
+| Issue | Title |
+|---|---|
+| [#2937](https://github.com/mesa/mesa/issues/2937) | Improper Redirection in Docs |
+| [#3061](https://github.com/mesa/mesa/issues/3061) | Memory leak and invalidation bug in `Cell.get_neighborhood` caching |
+| [#3064](https://github.com/mesa/mesa/issues/3064) | Race condition in `SpaceRenderer._map_coordinates` for NetworkGrid |
+| [#3067](https://github.com/mesa/mesa/issues/3067) | `PropertyLayer` contains bloated wrappers that duplicate native NumPy functionality |
+| [#3093](https://github.com/mesa/mesa/issues/3093) | `Grid2DMovingAgent` crashes on HexGrid due to static `DIRECTION_MAP` offsets |
+| [#3128](https://github.com/mesa/mesa/issues/3128) | Do we really need weakrefs in `AgentSet`? |
+| [#3190](https://github.com/mesa/mesa/issues/3190) | Reproducibility trap in `model.py` |
+| [#3209](https://github.com/mesa/mesa/issues/3209) | Tracking issue: `AgentSet` refactoring and `_HardKeyAgentSet` |
+| [#3297](https://github.com/mesa/mesa/issues/3297) | `DataRecorder` exhibits off-by-one error (captures pre-execution state) |
+| [#3302](https://github.com/mesa/mesa/issues/3302) | `DataRecorder` captures stale data due to redundant Observable triggers |
+| [#3307](https://github.com/mesa/mesa/issues/3307) | Broken BoltzmannWealth in benchmarks |
+| [#3481](https://github.com/mesa/mesa/issues/3481) | Resolve a `FIXME` in `mesa_signals/core.py` |
+| [#3490](https://github.com/mesa/mesa/issues/3490) | Optimise `_remove_agent` in Continuous Space |
+| [#3548](https://github.com/mesa/mesa/issues/3548) | Replace `np.vstack` in `ContinuousSpace` with an array-growth approach |
+| [#3798](https://github.com/mesa/mesa/issues/3798) | Tracking issue for Action preconditions, preemption and continuation *(open)* |
+
+Most of those are bugs I hit while doing something else and wrote up rather than worked around. Several became PRs of mine; a few were fixed by other people.
+
+I've also [reviewed 17 pull requests](https://github.com/mesa/mesa/pulls?q=is%3Apr+reviewed-by%3Acodebreaker32+-author%3Acodebreaker32) by other contributors and commented on 40. That's the part of open-source work that doesn't show up in a diff, and it's the part I'd want a maintainer to weigh.
+
+Every link on this page is a live query or a permanent URL, so none of it has to be taken on trust: [all 64 of my PRs](https://github.com/mesa/mesa/pulls?q=is%3Apr+author%3Acodebreaker32), [just the merged ones](https://github.com/mesa/mesa/pulls?q=is%3Apr+author%3Acodebreaker32+is%3Amerged), [my issues](https://github.com/mesa/mesa/issues?q=is%3Aissue+author%3Acodebreaker32).
 
 ---
 
