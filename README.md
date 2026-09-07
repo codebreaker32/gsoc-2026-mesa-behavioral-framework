@@ -7,8 +7,9 @@
 | **Contributor** | Aman Bihari ([@codebreaker32](https://github.com/codebreaker32)) |
 | **Organisation** | [Mesa](https://github.com/mesa/mesa) — agent-based modelling framework for Python |
 | **Upstream repository** | `mesa/mesa` |
-| **Primary deliverable** | `mesa.experimental.states` — new module, 492 lines, 441 lines of tests |
-| **Status** | 10 pull requests merged, 1 under review |
+| **Primary deliverable** | `mesa.experimental.states` — `ContinuousState` and `Threshold` |
+| **Also extends** | `mesa.experimental.actions` and the event list in `mesa.time` |
+| **Status** | Core API merged; `Agent.on_idle` under review |
 | **Tracking issue** | [#3798](https://github.com/mesa/mesa/issues/3798) |
 
 ---
@@ -113,6 +114,47 @@ value(t) = base_value + current_rate·Δt + 0.5·second_order_rate·Δt²
 
 Declaring a state auto-generates a shadow `{name}_rate` observable. A `__set_name__` guard raises `AttributeError` on a namespace collision, checked against both `__dict__` and `__slots__`.
 
+**Usage.**
+
+```python
+from mesa import Agent
+from mesa.experimental.mesa_signals import HasEmitters, Observable
+from mesa.experimental.states import ContinuousState
+
+
+class Reservoir(Agent, HasEmitters):
+    inflow  = Observable(fallback_value=0.0)
+    outflow = Observable(fallback_value=0.0)
+
+    # constant rate
+    sediment = ContinuousState(fallback_value=0.0, rate=0.02)
+
+    # callable rate, recomputed whenever inflow or outflow changes
+    volume = ContinuousState(fallback_value=500.0,
+                             rate=lambda a: a.inflow - a.outflow)
+
+
+r = Reservoir(model)
+r.inflow, r.outflow = 3.0, 1.0
+
+model.run_until(10.0)
+r.volume        # 520.0  — extrapolated, never stored per tick
+r.volume_rate   # 2.0    — the auto-generated shadow observable
+
+r.outflow = 5.0          # rate becomes -2.0; 520.0 is committed as the new baseline
+model.run_until(15.0)
+r.volume        # 510.0  — continuous across the rate change, not discontinuous
+```
+
+Chaining is implicit: if a state's rate resolves to another `ContinuousState`, the second-order term is discovered from the recorded dependencies and the extrapolation becomes quadratic.
+
+```python
+class Vehicle(Agent, HasEmitters):
+    acceleration = Observable(fallback_value=0.0)
+    speed    = ContinuousState(rate=lambda a: a.acceleration)   # first order
+    position = ContinuousState(rate=lambda a: a.speed)          # second order
+```
+
 ### 4.2 `Threshold`
 
 ```python
@@ -133,6 +175,43 @@ A class-level descriptor that fires a named agent method when `state` reaches `l
 Binding is lazy. The first `ContinuousState` access on an instance walks the MRO for `_continuous_thresholds` and wires up every threshold found. There is no registration step and no scheduler to attach to.
 
 Each threshold owns at most one live entry on the model's event list, cancelling and rescheduling as the trajectory changes. A trajectory that never reaches the limit cancels the event and parks the projected time at `math.inf`.
+
+**Usage.**
+
+```python
+from mesa.experimental.states import ContinuousState, Threshold
+
+
+class Sheep(Agent, HasEmitters):
+    energy   = ContinuousState(fallback_value=100.0, rate=-1.0)
+    starving = Observable(fallback_value=20.0)      # a per-instance limit
+
+    # fixed limit: the same for every sheep
+    _death = Threshold(state=energy, limit=0.0,
+                       callback="die", direction="falling")
+
+    # Observable limit: assigning to self.starving re-solves this threshold
+    _hungry = Threshold(state=energy, limit=starving,
+                        callback="seek_food", direction="falling")
+
+    def die(self):
+        self.remove()
+
+    def seek_food(self):
+        self.start_action(Forage(self))
+
+
+sheep = Sheep(model)
+sheep.starving = 35.0     # re-solves _hungry; no rearm() call exists
+```
+
+`direction` selects which crossings count:
+
+| `direction` | Fires when |
+|---|---|
+| `"rising"` | the value is increasing at the crossing |
+| `"falling"` | the value is decreasing at the crossing |
+| `"crossing"` | either, but not a tangent touch (zero velocity at the root) |
 
 ### 4.3 `Action` extensions
 
@@ -171,6 +250,36 @@ Both requirement parameters accept a single predicate or an iterable of them, mi
 - `start_requirements` is evaluated in `start()` **before** duration and priority are resolved. A failing predicate moves the action to `FAILED` and fires `on_fail()`; no `on_start()` runs and no completion event is scheduled.
 - `completion_requirements` is evaluated in `_do_complete()` before the effect is applied, and is empty by default. On failure `progress` still reads `1.0`, because the full duration did elapse; only the effect is withheld.
 
+**Usage.**
+
+```python
+from mesa.experimental.actions import Action, ActionState
+
+
+class Forage(Action):
+    def __init__(self, sheep, patch):
+        super().__init__(
+            sheep,
+            duration=lambda a: 5.0 / a.speed,        # callable, resolved at start()
+            priority=1.0,
+            start_requirements=lambda a: patch.grass > 0,
+            completion_requirements=lambda a: a.alive,
+        )
+        self.patch = patch
+
+    def on_start(self):    self.patch.grass -= 1
+    def on_complete(self): self.agent.energy += 20
+    def on_fail(self):     self.agent.wander()
+
+
+action = sheep.start_action(Forage(sheep, patch))
+
+action.state          # ActionState.ACTIVE, or FAILED if the grass was gone
+action.progress       # 0.0 -> 1.0, computed live from model.time
+action.remaining_time
+action.has_failed
+```
+
 ### 4.4 `Agent` hooks
 
 ```python
@@ -198,6 +307,67 @@ value = model.peek("time", 0.0)   # read an Observable without registering a dep
 ```
 
 Added in [#3774](https://github.com/mesa/mesa/pull/3774). Its necessity is explained in §5.3.
+
+### 4.6 A complete minimal model
+
+The smallest model that exercises both wake sources. A kettle heats at a constant rate, a threshold fires when it boils, and the agent starts a timed action in response; when that action ends, `on_idle` decides what happens next.
+
+```python
+from mesa import Agent, Model
+from mesa.experimental.actions import Action
+from mesa.experimental.mesa_signals import HasEmitters, Observable
+from mesa.experimental.states import ContinuousState, Threshold
+
+
+class Steep(Action):
+    def __init__(self, agent):
+        super().__init__(agent, duration=180.0)      # three minutes
+
+    def on_complete(self):
+        self.agent.cups_made += 1
+
+
+class Kettle(Agent, HasEmitters):
+    power       = Observable(fallback_value=0.0)
+    temperature = ContinuousState(fallback_value=20.0, rate=lambda a: a.power)
+
+    _boiled = Threshold(state=temperature, limit=100.0,
+                        callback="boiled", direction="rising")
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.cups_made = 0
+        self.power = 0.0
+        self.temperature = 20.0
+
+    def switch_on(self):
+        self.power = 0.5                 # degrees per second
+
+    def boiled(self):                    # wake source 1: the world crossed a line
+        self.power = 0.0
+        self.start_action(Steep(self))
+
+    def on_idle(self, previous):         # wake source 2: the body became free
+        if self.cups_made < 3:
+            self.temperature = 20.0      # fresh water
+            self.switch_on()
+
+
+class Kitchen(Model):
+    def __init__(self):
+        super().__init__()
+        self.kettle = Kettle(self)
+        self.schedule_event(self.kettle.switch_on, at=0.0)
+
+
+model = Kitchen()
+model.run_until(2000.0)
+model.kettle.cups_made        # 3
+```
+
+The kettle has no `step()`. Between `switch_on()` and `boiled()` the model holds exactly one scheduled event, and `temperature` is correct if read at any instant in between — it is never sampled.
+
+> **Note.** `Threshold` and `ContinuousState` are merged and available. `Agent.on_idle` is not: it is [#3833](https://github.com/mesa/mesa/pull/3833), still under review. Until that lands, the second wake source in this example must be written by scheduling the next heating cycle from `Steep.on_complete()` directly.
 
 ---
 
@@ -254,7 +424,7 @@ Further cases handled in code: assignment inside a computed context raises on cy
 
 An early revision read `model._time` directly. The public attribute could not be substituted naively: `model.time` is itself an `Observable`, so reading it inside a rate evaluation registers the clock as a dependency of *every* trajectory. Every tick would then re-snapshot every state, decomposing each parabola into a sequence of microscopic linear segments and destroying the exactness the design exists to provide.
 
-The resolution was a public non-reactive read, `HasEmitters.peek()`, split out as [#3774](https://github.com/mesa/mesa/pull/3774) — ten lines of implementation and sixty-three of tests. [#3764](https://github.com/mesa/mesa/pull/3764) extracted `ComputedState.evaluate()` so the rate machinery had a supported entry point. Both were merged before the main pull request.
+The resolution was a public non-reactive read, `HasEmitters.peek()`, split out as [#3774](https://github.com/mesa/mesa/pull/3774). [#3764](https://github.com/mesa/mesa/pull/3764) extracted `ComputedState.evaluate()` so the rate machinery had a supported entry point. Both were merged before the main pull request.
 
 ### 5.4 Declarative limits
 
@@ -598,11 +768,7 @@ More generally the approach is unfavourable when nearly every agent crosses a th
 
 ### 7.4 Tests
 
-| Suite | Tests | Attribution |
-|---|---:|---|
-| `tests/experimental/test_states.py` | 24 | all added by this project |
-| `tests/experimental/test_actions.py` | 101 | 61 pre-existing, 40 added by this project |
-| `tests/time/test_events.py` — compaction | 13 | added by this project |
+Every behaviour described above is covered by tests in `tests/experimental/test_states.py`, `tests/experimental/test_actions.py` and `tests/time/test_events.py`. The exact crossing times in §6.4 are asserted literally, so any drift in the solver fails the suite immediately.
 
 Mesa's CI additionally enforces `ruff` with the Google docstring convention, treats warnings as errors, and rejects coverage regressions.
 
@@ -626,7 +792,7 @@ The design was rejected on three grounds, all correct:
 
 [#3755](https://github.com/mesa/mesa/pull/3755) was closed in favour of [#3766](https://github.com/mesa/mesa/pull/3766) and the design rebuilt on `mesa_signals` and the existing event queue. The merged implementation allocates nothing per model, and its benchmark run shows initialisation times flat or marginally improved across all five benchmark models.
 
-The tombstone problem was addressed separately four weeks later in 78 lines of `events.py` (§5.6), rather than by a parallel runtime.
+The tombstone problem was addressed separately in `events.py` (§5.6), rather than by a parallel runtime.
 
 ### 8.2 A declarative rules engine
 
@@ -644,7 +810,7 @@ Two of the three originally proposed components therefore did not ship under the
 
 ## 9. Current state on `main`
 
-- `from mesa.experimental.states import ContinuousState, Threshold` is available. 492 lines, 24 tests. Experimental namespace; no semantic-versioning guarantee.
+- `from mesa.experimental.states import ContinuousState, Threshold` is available. Experimental namespace; no semantic-versioning guarantee.
 - `Action` accepts `start_requirements` and `completion_requirements`, exposes `ActionState.FAILED` and `on_fail()`, and `Agent.should_interrupt` gates every preemption.
 - **`Agent.on_idle` is not yet merged** — see [#3833](https://github.com/mesa/mesa/pull/3833).
 - `EventList` compacts adaptively and `len()` is O(1). This is in stable `mesa/time/` and applies to every model that cancels events.
@@ -674,21 +840,21 @@ Three pull requests touch stable modules (`mesa/time/events.py`, `mesa/agent.py`
 
 ### 11.1 This project
 
-| PR | Description | Diff | State |
-|---|---|---:|---|
-| [#3482](https://github.com/mesa/mesa/pull/3482) | Diffing engine for dependency autodiscovery in `mesa_signals` | +32 / −17 | merged |
-| [#3754](https://github.com/mesa/mesa/pull/3754) | First attempt: `ContinuousState` on a tensor backend | +567 / −4 | closed |
-| [#3755](https://github.com/mesa/mesa/pull/3755) | Second attempt, with a dedicated continuous scheduler | +618 / −8 | closed |
-| [#3764](https://github.com/mesa/mesa/pull/3764) | Extract `ComputedState.evaluate()` | +52 / −34 | merged |
-| [#3774](https://github.com/mesa/mesa/pull/3774) | Add `HasEmitters.peek()` for non-reactive reads | +74 / −0 | merged |
-| [#3785](https://github.com/mesa/mesa/pull/3785) | Add the `examples/experimental/` tier | +14 / −7 | merged |
-| [#3788](https://github.com/mesa/mesa/pull/3788) | Generate Read the Docs pages for the new tier | +8 / −14 | merged |
-| **[#3766](https://github.com/mesa/mesa/pull/3766)** | **`ContinuousState` and `Threshold`** | **+938 / −0** | **merged** |
-| [#3796](https://github.com/mesa/mesa/pull/3796) | Tram route model — worked example with no agent `step()` | +702 / −0 | merged |
-| [#3800](https://github.com/mesa/mesa/pull/3800) | Adaptive event-list compaction and O(1) `__len__` | +293 / −2 | merged |
-| [#3801](https://github.com/mesa/mesa/pull/3801) | Requirement lists and an `ActionState.FAILED` path | +376 / −8 | merged |
-| [#3805](https://github.com/mesa/mesa/pull/3805) | `Agent.should_interrupt`, giving `Action.priority` effect | +181 / −21 | merged |
-| [#3833](https://github.com/mesa/mesa/pull/3833) | `Agent.on_idle` as a deferred low-priority wake | +263 / −22 | **open** |
+| PR | Description | State |
+|---|---|---|
+| [#3482](https://github.com/mesa/mesa/pull/3482) | Diffing engine for dependency autodiscovery in `mesa_signals` | merged |
+| [#3754](https://github.com/mesa/mesa/pull/3754) | First attempt: `ContinuousState` on a tensor backend | closed |
+| [#3755](https://github.com/mesa/mesa/pull/3755) | Second attempt, with a dedicated continuous scheduler | closed |
+| [#3764](https://github.com/mesa/mesa/pull/3764) | Extract `ComputedState.evaluate()` | merged |
+| [#3774](https://github.com/mesa/mesa/pull/3774) | Add `HasEmitters.peek()` for non-reactive reads | merged |
+| [#3785](https://github.com/mesa/mesa/pull/3785) | Add the `examples/experimental/` tier | merged |
+| [#3788](https://github.com/mesa/mesa/pull/3788) | Generate Read the Docs pages for the new tier | merged |
+| **[#3766](https://github.com/mesa/mesa/pull/3766)** | **`ContinuousState` and `Threshold` — the core deliverable** | **merged** |
+| [#3796](https://github.com/mesa/mesa/pull/3796) | Tram route model — worked example with no agent `step()` | merged |
+| [#3800](https://github.com/mesa/mesa/pull/3800) | Adaptive event-list compaction and O(1) `__len__` | merged |
+| [#3801](https://github.com/mesa/mesa/pull/3801) | Requirement lists and an `ActionState.FAILED` path | merged |
+| [#3805](https://github.com/mesa/mesa/pull/3805) | `Agent.should_interrupt`, giving `Action.priority` effect | merged |
+| [#3833](https://github.com/mesa/mesa/pull/3833) | `Agent.on_idle` as a deferred low-priority wake | **open** |
 
 ### 11.2 Tracking issue
 
@@ -706,134 +872,134 @@ A prior tracking issue, [#3209](https://github.com/mesa/mesa/issues/3209), serve
 
 ### 11.3 Prior contributions to Mesa
 
-First pull request merged 18 December 2025, three months before GSoC applications opened. **64 pull requests opened, 48 merged**, +7,518 / −2,115 lines across the merged set. Between December and May, Mesa merged 268 pull requests from all authors; 38 were from this contributor, the second-highest count over that period.
+The first pull request merged on 18 December 2025, three months before GSoC applications opened. The work below is what made the GSoC project possible: the reactive signal layer it is built on, the agent storage and space refactors, and the data-collection system.
 
-The thirteen listed in §11.1 constitute the GSoC project. The remainder follow, grouped by subsystem.
+Those listed in §11.1 constitute the GSoC project. The remainder follow, grouped by subsystem.
 
 #### Reactive signals — `mesa_signals`
 
 The observable/computed layer the continuous-state work is built on. I spent the winter fixing and speeding it up, which is the only reason I knew it well enough to build on it later.
 
-| PR | Title | Diff | State |
-|---|---|---:|---|
-| [#3153](https://github.com/mesa/mesa/pull/3153) | Replace Computable Descriptor with @computed in mesa_signals | +225 / −146 | merged |
-| [#3198](https://github.com/mesa/mesa/pull/3198) | Optimise mesa_signals by skipping signals for empty subscribers to reduce subsequent overheads | +73 / −37 | merged |
-| [#3255](https://github.com/mesa/mesa/pull/3255) | Fix docstring in `mesa_signals/core.py` | +3 / −2 | merged |
-| [#3462](https://github.com/mesa/mesa/pull/3462) | Add static dependency injection to `@computed_property` for `@emit` support | +163 / −42 | merged |
-| [#3486](https://github.com/mesa/mesa/pull/3486) | Fixes a cache-invalidation bug for `SignalingList` | +43 / −5 | merged |
+| PR | Title | State |
+|---|---|---|
+| [#3153](https://github.com/mesa/mesa/pull/3153) | Replace Computable Descriptor with @computed in mesa_signals | merged |
+| [#3198](https://github.com/mesa/mesa/pull/3198) | Optimise mesa_signals by skipping signals for empty subscribers to reduce subsequent overheads | merged |
+| [#3255](https://github.com/mesa/mesa/pull/3255) | Fix docstring in `mesa_signals/core.py` | merged |
+| [#3462](https://github.com/mesa/mesa/pull/3462) | Add static dependency injection to `@computed_property` for `@emit` support | merged |
+| [#3486](https://github.com/mesa/mesa/pull/3486) | Fixes a cache-invalidation bug for `SignalingList` | merged |
 
 #### Agent storage — `AgentSet`
 
 Mesa held its agents in weak-referenced sets, which cost lookup time on the hottest path in the framework. This introduced an abstract base and a strong-keyed variant underneath it, then switched `Model` over. Tracked in issue #3209.
 
-| PR | Title | Diff | State |
-|---|---|---:|---|
-| [#3160](https://github.com/mesa/mesa/pull/3160) | Introducing _StrongAgentSet to support strong references in agents.py | +367 / −9 | closed |
-| [#3163](https://github.com/mesa/mesa/pull/3163) | Optimise create_agents by replacing 'ListLike' approach with itertools | +40 / −27 | merged |
-| [#3210](https://github.com/mesa/mesa/pull/3210) | Introduce AbstractAgentSet to agent.py and refactor AgentSet to inherit from it | +312 / −210 | merged |
-| [#3219](https://github.com/mesa/mesa/pull/3219) | Introduce `_HardKeyAgentSet` in agents.py | +398 / −16 | merged |
-| [#3224](https://github.com/mesa/mesa/pull/3224) | Update `model.py` to replace `AgentSet` with `_HardKeyAgentSet` | +54 / −19 | merged |
-| [#3448](https://github.com/mesa/mesa/pull/3448) | Micro-optimisations in agent and agentset | +10 / −10 | closed |
+| PR | Title | State |
+|---|---|---|
+| [#3160](https://github.com/mesa/mesa/pull/3160) | Introducing _StrongAgentSet to support strong references in agents.py | closed |
+| [#3163](https://github.com/mesa/mesa/pull/3163) | Optimise create_agents by replacing 'ListLike' approach with itertools | merged |
+| [#3210](https://github.com/mesa/mesa/pull/3210) | Introduce AbstractAgentSet to agent.py and refactor AgentSet to inherit from it | merged |
+| [#3219](https://github.com/mesa/mesa/pull/3219) | Introduce `_HardKeyAgentSet` in agents.py | merged |
+| [#3224](https://github.com/mesa/mesa/pull/3224) | Update `model.py` to replace `AgentSet` with `_HardKeyAgentSet` | merged |
+| [#3448](https://github.com/mesa/mesa/pull/3448) | Micro-optimisations in agent and agentset | closed |
 
 #### Data collection — `DataRecorder`
 
 A reactive alternative to the legacy `DataCollector`: datasets that subscribe to signals instead of being polled once per step, with memory, JSON, parquet and SQL backends. The single largest thing I've added to Mesa.
 
-| PR | Title | Diff | State |
-|---|---|---:|---|
-| [#3109](https://github.com/mesa/mesa/pull/3109) | Fix batch_run Data Collection to Ensure Accuracy and Capture All Steps | +139 / −8 | merged |
-| [#3145](https://github.com/mesa/mesa/pull/3145) | Add `DataRecorder` for reactive Data Storage and `DatasetConfig` for Configuration | +1,821 / −0 | merged |
-| [#3299](https://github.com/mesa/mesa/pull/3299) | Resolve `DataRecorder` off-by-one timestamp error | +1 / −1 | merged |
-| [#3408](https://github.com/mesa/mesa/pull/3408) | Add time column to empty dataframe in `datarecorder` | +3 / −5 | merged |
-| [#3424](https://github.com/mesa/mesa/pull/3424) | Add explicit `RUN_ENDED` signal for terminal data handling in `DataRecorder` | +129 / −29 | merged |
-| [#3579](https://github.com/mesa/mesa/pull/3579) | Fix empty batch_run results when model_reporters is None | +38 / −2 | merged |
+| PR | Title | State |
+|---|---|---|
+| [#3109](https://github.com/mesa/mesa/pull/3109) | Fix batch_run Data Collection to Ensure Accuracy and Capture All Steps | merged |
+| [#3145](https://github.com/mesa/mesa/pull/3145) | Add `DataRecorder` for reactive Data Storage and `DatasetConfig` for Configuration | merged |
+| [#3299](https://github.com/mesa/mesa/pull/3299) | Resolve `DataRecorder` off-by-one timestamp error | merged |
+| [#3408](https://github.com/mesa/mesa/pull/3408) | Add time column to empty dataframe in `datarecorder` | merged |
+| [#3424](https://github.com/mesa/mesa/pull/3424) | Add explicit `RUN_ENDED` signal for terminal data handling in `DataRecorder` | merged |
+| [#3579](https://github.com/mesa/mesa/pull/3579) | Fix empty batch_run results when model_reporters is None | merged |
 
 #### Discrete spaces and the removal of `PropertyLayer`
 
-`PropertyLayer` was a wrapper class around what was already a NumPy array. Four PRs replaced it with the array itself and then deleted the module, net −536 lines. Separately, cells learned to distinguish their logical index from their physical position, which is what made network layouts drawable.
+`PropertyLayer` was a wrapper class around what was already a NumPy array. Four PRs replaced it with the array itself and then deleted the module. Separately, cells learned to distinguish their logical index from their physical position, which is what made network layouts drawable.
 
-| PR | Title | Diff | State |
-|---|---|---:|---|
-| [#3074](https://github.com/mesa/mesa/pull/3074) | Refactor PropertyLayer to implement NumPy interface | +18 / −35 | merged |
-| [#3080](https://github.com/mesa/mesa/pull/3080) | Enforce read-only safety for 'empty' layer | +54 / −6 | closed |
-| [#3087](https://github.com/mesa/mesa/pull/3087) | Optimise select_random_empty_cell() in grid.py | +39 / −6 | merged |
-| [#3096](https://github.com/mesa/mesa/pull/3096) | Add HexGridMovingAgent to cell_agent | +107 / −3 | merged |
-| [#3268](https://github.com/mesa/mesa/pull/3268) | Distinguish Logical Index from Physical Position | +408 / −19 | merged |
-| [#3340](https://github.com/mesa/mesa/pull/3340) | Remove PropertyLayer and HasPropertyLayers mixin  | +410 / −516 | merged |
-| [#3355](https://github.com/mesa/mesa/pull/3355) | Enforce default physical layout for Network spaces | +8 / −18 | merged |
-| [#3387](https://github.com/mesa/mesa/pull/3387) | Convert DiscreteSpace to an Abstract Base Class | +14 / −10 | merged |
-| [#3432](https://github.com/mesa/mesa/pull/3432) | Delete property_layer.py | +0 / −446 | merged |
+| PR | Title | State |
+|---|---|---|
+| [#3074](https://github.com/mesa/mesa/pull/3074) | Refactor PropertyLayer to implement NumPy interface | merged |
+| [#3080](https://github.com/mesa/mesa/pull/3080) | Enforce read-only safety for 'empty' layer | closed |
+| [#3087](https://github.com/mesa/mesa/pull/3087) | Optimise select_random_empty_cell() in grid.py | merged |
+| [#3096](https://github.com/mesa/mesa/pull/3096) | Add HexGridMovingAgent to cell_agent | merged |
+| [#3268](https://github.com/mesa/mesa/pull/3268) | Distinguish Logical Index from Physical Position | merged |
+| [#3340](https://github.com/mesa/mesa/pull/3340) | Remove PropertyLayer and HasPropertyLayers mixin  | merged |
+| [#3355](https://github.com/mesa/mesa/pull/3355) | Enforce default physical layout for Network spaces | merged |
+| [#3387](https://github.com/mesa/mesa/pull/3387) | Convert DiscreteSpace to an Abstract Base Class | merged |
+| [#3432](https://github.com/mesa/mesa/pull/3432) | Delete property_layer.py | merged |
 
 #### Continuous space
 
 Allocation and removal on the hot path, plus two attempts at pathfinding over stacked spaces that I did not land.
 
-| PR | Title | Diff | State |
-|---|---|---:|---|
-| [#3491](https://github.com/mesa/mesa/pull/3491) | Optimise `_remove_agent` in Continuous Space | +28 / −30 | merged |
-| [#3537](https://github.com/mesa/mesa/pull/3537) | pathfinding for stacked space | +171 / −7 | closed |
-| [#3556](https://github.com/mesa/mesa/pull/3556) | Refactor _add_agent in ContinuousSpace | +11 / −11 | merged |
-| [#3678](https://github.com/mesa/mesa/pull/3678) | Pathfinding for Stacked Space | +180 / −7 | closed |
+| PR | Title | State |
+|---|---|---|
+| [#3491](https://github.com/mesa/mesa/pull/3491) | Optimise `_remove_agent` in Continuous Space | merged |
+| [#3537](https://github.com/mesa/mesa/pull/3537) | pathfinding for stacked space | closed |
+| [#3556](https://github.com/mesa/mesa/pull/3556) | Refactor _add_agent in ContinuousSpace | merged |
+| [#3678](https://github.com/mesa/mesa/pull/3678) | Pathfinding for Stacked Space | closed |
 
 #### Visualisation
 
 Mostly consequences of the space work above — drawers and the network renderer had to follow the cell-position change.
 
-| PR | Title | Diff | State |
-|---|---|---:|---|
-| [#3059](https://github.com/mesa/mesa/pull/3059) | Minor Refactoring in solara_viz | +3 / −4 | merged |
-| [#3065](https://github.com/mesa/mesa/pull/3065) | Fix race around condition in space_renderer | +17 / −8 | closed |
-| [#3323](https://github.com/mesa/mesa/pull/3323) | Modify Space Drawers to use explicit Cell positions | +18 / −20 | merged |
-| [#3344](https://github.com/mesa/mesa/pull/3344) | Remove `model.steps` usage from solara_viz | +1 / −1 | merged |
-| [#3345](https://github.com/mesa/mesa/pull/3345) | Update `Network` to use `Cell.position` and `layout` for Visualisation | +37 / −180 | merged |
+| PR | Title | State |
+|---|---|---|
+| [#3059](https://github.com/mesa/mesa/pull/3059) | Minor Refactoring in solara_viz | merged |
+| [#3065](https://github.com/mesa/mesa/pull/3065) | Fix race around condition in space_renderer | closed |
+| [#3323](https://github.com/mesa/mesa/pull/3323) | Modify Space Drawers to use explicit Cell positions | merged |
+| [#3344](https://github.com/mesa/mesa/pull/3344) | Remove `model.steps` usage from solara_viz | merged |
+| [#3345](https://github.com/mesa/mesa/pull/3345) | Update `Network` to use `Cell.position` and `layout` for Visualisation | merged |
 
 #### Benchmarks
 
 The harness compares timings across commits, so it has to be trustworthy before anything else is. Warm-up runs, `gc` disabled around the timed loop, and every example moved onto `Scenario`.
 
-| PR | Title | Diff | State |
-|---|---|---:|---|
-| [#3177](https://github.com/mesa/mesa/pull/3177) | Fix typo in configurations.py | +1 / −1 | merged |
-| [#3203](https://github.com/mesa/mesa/pull/3203) | Make benchmarking more robust | +21 / −5 | merged |
-| [#3314](https://github.com/mesa/mesa/pull/3314) | Use scenario for all examples in benchmarks | +209 / −126 | merged |
+| PR | Title | State |
+|---|---|---|
+| [#3177](https://github.com/mesa/mesa/pull/3177) | Fix typo in configurations.py | merged |
+| [#3203](https://github.com/mesa/mesa/pull/3203) | Make benchmarking more robust | merged |
+| [#3314](https://github.com/mesa/mesa/pull/3314) | Use scenario for all examples in benchmarks | merged |
 
 #### Core correctness and cleanup
 
 Reproducibility and lifecycle bugs, mostly found while doing something else.
 
-| PR | Title | Diff | State |
-|---|---|---:|---|
-| [#2978](https://github.com/mesa/mesa/pull/2978) | Fix reproducibility warnings by adding explicit random parameters | +15 / −10 | merged |
-| [#3036](https://github.com/mesa/mesa/pull/3036) | Add initialization check in Simulator.run_for() | +23 / −5 | merged |
-| [#3192](https://github.com/mesa/mesa/pull/3192) | Fix seed logic to ensure reproducibility | +30 / −3 | merged |
-| [#3298](https://github.com/mesa/mesa/pull/3298) | Revert "Add a signal at start of run (#3284)" | +1 / −5 | merged |
-| [#3335](https://github.com/mesa/mesa/pull/3335) | Remove additional lines of code used for testing | +0 / −5 | merged |
+| PR | Title | State |
+|---|---|---|
+| [#2978](https://github.com/mesa/mesa/pull/2978) | Fix reproducibility warnings by adding explicit random parameters | merged |
+| [#3036](https://github.com/mesa/mesa/pull/3036) | Add initialization check in Simulator.run_for() | merged |
+| [#3192](https://github.com/mesa/mesa/pull/3192) | Fix seed logic to ensure reproducibility | merged |
+| [#3298](https://github.com/mesa/mesa/pull/3298) | Revert "Add a signal at start of run (#3284)" | merged |
+| [#3335](https://github.com/mesa/mesa/pull/3335) | Remove additional lines of code used for testing | merged |
 
 #### Docs and navigation
 
 Small but they were broken.
 
-| PR | Title | Diff | State |
-|---|---|---:|---|
-| [#2938](https://github.com/mesa/mesa/pull/2938) | Fix Navigation Issue | +4 / −4 | merged |
-| [#2970](https://github.com/mesa/mesa/pull/2970) | Support capacity-aware cell selection | +47 / −25 | closed |
-| [#3723](https://github.com/mesa/mesa/pull/3723) | Testing RTD Dropdown Fix | +4 / −4 | closed |
+| PR | Title | State |
+|---|---|---|
+| [#2938](https://github.com/mesa/mesa/pull/2938) | Fix Navigation Issue | merged |
+| [#2970](https://github.com/mesa/mesa/pull/2970) | Support capacity-aware cell selection | closed |
+| [#3723](https://github.com/mesa/mesa/pull/3723) | Testing RTD Dropdown Fix | closed |
 
 #### Closed without merging — early proposals
 
 My first weeks. An exception hierarchy proposed twice and declined, two example models that did not fit the examples policy, and one branch pushed under a placeholder title. Listed because leaving them out would misrepresent the ratio.
 
-| PR | Title | Diff | State |
-|---|---|---:|---|
-| [#2991](https://github.com/mesa/mesa/pull/2991) | Feat: Introduce dedicated exception hierarchy in mesa/errors.py | +146 / −10 | closed |
-| [#2992](https://github.com/mesa/mesa/pull/2992) | Feat: Introduce dedicated exception hierarchy in mesa/errors.py  | +191 / −0 | closed |
-| [#3040](https://github.com/mesa/mesa/pull/3040) | Add new example to MESA advanced examples | +334 / −0 | closed |
-| [#3050](https://github.com/mesa/mesa/pull/3050) | Add Emperor's Dilemma to mesa-examples | +327 / −0 | closed |
-| [#3589](https://github.com/mesa/mesa/pull/3589) | check | +392 / −0 | closed |
+| PR | Title | State |
+|---|---|---|
+| [#2991](https://github.com/mesa/mesa/pull/2991) | Feat: Introduce dedicated exception hierarchy in mesa/errors.py | closed |
+| [#2992](https://github.com/mesa/mesa/pull/2992) | Feat: Introduce dedicated exception hierarchy in mesa/errors.py  | closed |
+| [#3040](https://github.com/mesa/mesa/pull/3040) | Add new example to MESA advanced examples | closed |
+| [#3050](https://github.com/mesa/mesa/pull/3050) | Add Emperor's Dilemma to mesa-examples | closed |
+| [#3589](https://github.com/mesa/mesa/pull/3589) | check | closed |
 
 ### 11.4 Issues and review
 
-Fifteen issues opened, fourteen closed:
+Issues opened during this work, most of them defects encountered while implementing something else:
 
 | Issue | Title |
 |---|---|
@@ -853,7 +1019,7 @@ Fifteen issues opened, fourteen closed:
 | [#3548](https://github.com/mesa/mesa/issues/3548) | Replace `np.vstack` in `ContinuousSpace` with an array-growth approach |
 | [#3798](https://github.com/mesa/mesa/issues/3798) | Tracking issue for Action preconditions, preemption and continuation *(open)* |
 
-Additionally, [17 pull requests by other contributors reviewed](https://github.com/mesa/mesa/pulls?q=is%3Apr+reviewed-by%3Acodebreaker32+-author%3Acodebreaker32) and 40 commented on.
+I have also [reviewed pull requests by other contributors](https://github.com/mesa/mesa/pulls?q=is%3Apr+reviewed-by%3Acodebreaker32+-author%3Acodebreaker32).
 
 Verification links: [all pull requests](https://github.com/mesa/mesa/pulls?q=is%3Apr+author%3Acodebreaker32) · [merged only](https://github.com/mesa/mesa/pulls?q=is%3Apr+author%3Acodebreaker32+is%3Amerged) · [issues](https://github.com/mesa/mesa/issues?q=is%3Aissue+author%3Acodebreaker32)
 
@@ -865,9 +1031,9 @@ Verification links: [all pull requests](https://github.com/mesa/mesa/pulls?q=is%
 
 **The choice of benchmark model encodes an assumption about users.** Designing against Sugarscape made the rejected architecture appear necessary; the transit model the maintainers proposed did not.
 
-**Declarative interfaces eliminate classes of error, not merely lines of code.** Replacing `set_limit()` and `rearm()` with an observable limit removed the failure mode in which a model omits the re-arm call and the threshold silently never fires again.
+**Declarative interfaces eliminate classes of error, not merely code.** Replacing `set_limit()` and `rearm()` with an observable limit removed the failure mode in which a model omits the re-arm call and the threshold silently never fires again.
 
-**Stacked pull requests review faster than large ones.** [#3766](https://github.com/mesa/mesa/pull/3766) required 41 days and 24 inline comments. The action work, of comparable size, was split into three single-purpose pull requests tracked by a public issue, each merged within a fortnight. Enabling changes were extracted proactively for the same reason.
+**Stacked pull requests review faster than large ones.** [#3766](https://github.com/mesa/mesa/pull/3766) sat in review for six weeks. The action work, of comparable size, was split into three single-purpose pull requests tracked by a public issue and moved considerably faster. Enabling changes were extracted proactively for the same reason.
 
 **Writing the design down first was not overhead.** The baseline evaluation cost approximately one week and produced the framing on which the entire project rested.
 
