@@ -1,101 +1,572 @@
-# Teaching Mesa agents to stop watching the clock
+# Continuous-Time Agent State for Mesa
 
-**Google Summer of Code 2026 · [Project Mesa](https://github.com/mesa/mesa) · Aman Bihari ([@codebreaker32](https://github.com/codebreaker32))**
+**Google Summer of Code 2026 — final work product**
 
-Mesa is the agent-based modelling framework for Python. I spent this summer adding a way for an agent's state to change *continuously* — and for the model to be told the exact moment that state crosses a line, instead of checking every tick to see whether it has yet.
-
-Ten pull requests merged, one still in review. The core of it is a new module, `mesa.experimental.states`, which is about 490 lines of implementation and 440 of tests. Everything below links to the actual PR, so you can check any of it.
+| | |
+|---|---|
+| **Contributor** | Aman Bihari ([@codebreaker32](https://github.com/codebreaker32)) |
+| **Organisation** | [Mesa](https://github.com/mesa/mesa) — agent-based modelling framework for Python |
+| **Upstream repository** | `mesa/mesa` |
+| **Primary deliverable** | `mesa.experimental.states` — new module, 492 lines, 441 lines of tests |
+| **Status** | 10 pull requests merged, 1 under review |
+| **Tracking issue** | [#3798](https://github.com/mesa/mesa/issues/3798) |
 
 ---
 
-## The thing that was wrong
+## 1. Summary
 
-Mesa 4 is event-driven underneath. There's no step counter; `Model.time` is a float, and everything — including your own `step()` — runs off a single event list. That's a genuinely nice engine.
+Mesa 4 advances simulated time through a single event list, but its modelling API required agents to be driven by a per-tick `step()` method. Quantities that vary continuously had to be re-integrated by hand on every tick, and every threshold condition had to be re-tested on every tick.
 
-The problem is that nothing exposed it to the person writing the model. Here's `Animal.step` from Mesa's own wolf–sheep example. This is on `main` right now:
+This project adds a declarative alternative. A quantity states its rate of change once; Mesa stores it as a trajectory and extrapolates it exactly on read. A `Threshold` solves in closed form for the time at which that trajectory reaches a limit and schedules a single event at that instant. Transition detection becomes exact rather than quantised to the tick grid, and its cost scales with the number of transitions rather than the number of ticks.
+
+A second strand extends Mesa's existing `Action` primitive with preconditions, a failure state, priority-based preemption and an idle-wake hook. A third fixes the event-list growth that the threshold design exposes.
+
+---
+
+## 2. Problem statement
+
+### 2.1 The defect
+
+Mesa 4 has no step counter. `Model.time` is a float and every state change, including the user's `step()`, is dispatched from one `EventList`. The engine is therefore event-scheduling based. The modelling API was not.
+
+The following is `Animal.step` from Mesa's own wolf–sheep example, unchanged on `main`:
 
 ```python
 def step(self):
     self.move()
 
-    self.energy -= 1          # decay, by hand, once per tick
+    self.energy -= 1          # continuous decay, re-integrated by hand each tick
 
     self.feed()
 
-    if self.energy < 0:       # threshold, re-checked, once per tick
+    if self.energy < 0:       # threshold, re-tested each tick
         self.remove()
     elif self.random.random() < self.p_reproduce:
         self.spawn_offspring()
 ```
 
-Two lines there are the whole problem.
+Two properties of this code are the subject of this project:
 
-The decay is arithmetic you have to remember to write, and it's only correct because the tick happens to be `1.0`. Change the timestep and it silently means something different.
+1. **The decay is manual and timestep-dependent.** `self.energy -= 1` is only the intended rate because the tick happens to be `1.0`. Changing the timestep silently changes the model's semantics.
+2. **The threshold is polled.** The comparison executes once per agent per tick, and starvation can only be detected at a tick boundary — never at the instant it occurred. The engine was capable of scheduling that event exactly; no API exposed the capability.
 
-The death check is a poll. It runs for every animal on every tick, and it can only ever notice starvation *at a tick boundary* — never at the moment it actually happened. Mesa's engine could have scheduled that death exactly. Nothing let you say so.
+### 2.2 Empirical basis
 
-Before proposing anything I built a baseline model in stock Mesa — a needs-based homeostatic agent, continuous decay, priority-driven decisions, spatial foraging — specifically to write down where it hurt, and posted that as [discussion #3721](https://github.com/mesa/mesa/discussions/3721). Jan Kwakkel replied with the framing the whole project ended up hanging off:
+Before proposing new primitives, a baseline model was implemented in unmodified Mesa — a needs-based homeostatic agent with continuous state decay, priority-ordered decisions and spatial foraging — for the purpose of documenting the friction it produced. The findings were published as [discussion #3721](https://github.com/mesa/mesa/discussions/3721) and identified four failure modes: manual decay arithmetic, polled thresholds, positional rather than declarative priority, and the impossibility of expressing a durative interruptible task without hand-rolled state.
+
+Maintainer Jan Kwakkel supplied the framing the project was subsequently built around:
 
 > Event scheduling … provides a locality of time. Activity scanning … provides a locality of state. Process interaction … provides a locality of object. Mesa 4 is event scheduling based, defaulting to incremental time advancement.
 
-That's the diagnosis, and it's sharper than anything I'd written. Mesa's *engine* is event scheduling. Its *modelling API* made you write activity scanning on top of it.
+The diagnosis follows: Mesa's engine implements event scheduling while its modelling API required activity scanning to be written on top of it.
 
-To be clear about credit: I didn't spot this first. Ewout ter Hoeven had opened discussions about [Tasks](https://github.com/mesa/mesa/discussions/2526), [Continuous States](https://github.com/mesa/mesa/discussions/2529) and [a Behavioral Framework](https://github.com/mesa/mesa/discussions/2538) back in December 2024. What didn't exist was evidence — a concrete account of where a real model breaks, and in what order to attack it.
+### 2.3 Prior art
+
+The problem was not identified by this project. Ewout ter Hoeven opened three discussions on it in December 2024 — [Tasks](https://github.com/mesa/mesa/discussions/2526), [Continuous States](https://github.com/mesa/mesa/discussions/2529) and [Behavioral Framework](https://github.com/mesa/mesa/discussions/2538) — and contributed the `Action` primitive in [#3461](https://github.com/mesa/mesa/pull/3461). This project contributes the empirical baseline, the continuous-state implementation, and the extensions to `Action` described in §4.3.
 
 ---
 
-## What I built
+## 3. Design
 
-Two pieces, meeting at the event list Mesa already had.
+The implementation is built entirely on primitives Mesa already possessed: the reactive observables in `mesa.experimental.mesa_signals`, and the event list in `mesa.time`. No scheduler is introduced and no per-model allocation is added; §8.1 records the rejected design that did both.
 
-**`ContinuousState`** stores a value as a *trajectory* rather than a number: a baseline, a timestamp, and a rate. Reading the attribute extrapolates to the current model time, so it's exact whenever you ask, not just on tick boundaries. Rates can be callables, and they chain — `position' = speed`, `speed' = acceleration` — in which case the extrapolation picks up the second-order term and goes piecewise quadratic.
+```
+ declaration                trajectory store            analytic solver           event list           callback
+ ───────────                ────────────────            ───────────────           ──────────           ────────
+ speed = ContinuousState(   base_value                  0.5at² + vt + (x₀−L) = 0  binary heap          agent.brake()
+     rate=lambda a:  ────►  last_time          ────►    filter roots by v(t)  ──► one event   ────►    agent.on_idle()
+         a.acceleration)    current_rate                → crossing time t*        per threshold
+ Threshold(speed, 15.0,     second_order_rate
+     "start_coasting")
+                                  ▲                                                                        │
+                                  └──────────── the callback assigns a new rate or limit ───────────────────┘
+                                     the trajectory is re-baselined, the solver re-runs,
+                                     the old event is cancelled, one replacement is scheduled
+```
 
-**`Threshold`** turns that trajectory into a scheduled event. Because the trajectory is known in closed form, the moment it reaches a limit can be *solved for* instead of watched for. Each threshold keeps exactly one live event on the heap and re-solves itself whenever the trajectory or the limit changes.
+The feedback edge is the substance of the design. A threshold's projected crossing time is a derived value, not a one-time registration: changing an acceleration or moving a limit causes the solver to re-run and the scheduled event to be replaced. This is also what makes the event list churn, which §5.6 addresses.
 
-The whole tram example agent looks like this. There is no `step()`:
+---
+
+## 4. API
+
+### 4.1 `ContinuousState`
 
 ```python
+from mesa.experimental.states import ContinuousState
+
+class ContinuousState(BaseObservable):
+    def __init__(
+        self,
+        fallback_value: float = 0.0,
+        rate: float | Callable[[Any], float] = 0.0,
+    ) -> None: ...
+```
+
+A descriptor that stores a value as a trajectory rather than a scalar. Per instance it holds `base_value`, `last_time`, `current_rate` and `second_order_rate`. Reading the attribute extrapolates to the current model time:
+
+```
+value(t) = base_value + current_rate·Δt + 0.5·second_order_rate·Δt²
+```
+
+`rate` is either a constant or a callable `f(agent) -> float` evaluated through the `mesa_signals` dependency-diffing engine, so it recomputes when its inputs change. When a rate changes, the current value is snapshotted using the *previous* rate and committed as the new baseline, keeping the trajectory continuous across the transition rather than discontinuous.
+
+Declaring a state auto-generates a shadow `{name}_rate` observable. A `__set_name__` guard raises `AttributeError` on a namespace collision, checked against both `__dict__` and `__slots__`.
+
+### 4.2 `Threshold`
+
+```python
+from mesa.experimental.states import Threshold
+
+class Threshold:
+    def __init__(
+        self,
+        state: ContinuousState,
+        limit: float | Observable,
+        callback: str,
+        direction: str = "crossing",   # "rising" | "falling" | "crossing"
+    ) -> None: ...
+```
+
+A class-level descriptor that fires a named agent method when `state` reaches `limit`. `limit` may be a fixed float **or** an `Observable` on the agent; in the latter case `bind()` subscribes to the limit's `CHANGED` signal as well as the state's, so a per-instance runtime target is set by plain assignment and re-solves itself.
+
+Binding is lazy. The first `ContinuousState` access on an instance walks the MRO for `_continuous_thresholds` and wires up every threshold found. There is no registration step and no scheduler to attach to.
+
+Each threshold owns at most one live entry on the model's event list, cancelling and rescheduling as the trajectory changes. A trajectory that never reaches the limit cancels the event and parks the projected time at `math.inf`.
+
+### 4.3 `Action` extensions
+
+The `Action` class and its four-state lifecycle are pre-existing work by Ewout ter Hoeven ([#3461](https://github.com/mesa/mesa/pull/3461)). The parameters and states marked `# added` below were contributed by this project.
+
+```python
+from mesa.experimental.actions import Action, ActionState
+
+class Action:
+    def __init__(
+        self,
+        agent: Agent,
+        duration: float | Callable[[Agent], float] = 1.0,
+        *,
+        name: str | None = None,
+        priority: float | Callable[[Agent], float] = 0.0,
+        interruptible: bool = True,
+        start_requirements: Callable[[Agent], bool]              # added
+        | Iterable[Callable[[Agent], bool]]
+        | None = None,
+        completion_requirements: Callable[[Agent], bool]         # added
+        | Iterable[Callable[[Agent], bool]]
+        | None = None,
+    ) -> None: ...
+
+class ActionState(IntEnum):
+    PENDING     = auto()
+    ACTIVE      = auto()
+    COMPLETED   = auto()
+    INTERRUPTED = auto()
+    FAILED      = auto()   # added
+```
+
+Both requirement parameters accept a single predicate or an iterable of them, mirroring how `duration` and `priority` already accept callables resolved against the agent. Subclasses may assign to either list after `super().__init__()`.
+
+- `start_requirements` is evaluated in `start()` **before** duration and priority are resolved. A failing predicate moves the action to `FAILED` and fires `on_fail()`; no `on_start()` runs and no completion event is scheduled.
+- `completion_requirements` is evaluated in `_do_complete()` before the effect is applied, and is empty by default. On failure `progress` still reads `1.0`, because the full duration did elapse; only the effect is withheld.
+
+### 4.4 `Agent` hooks
+
+```python
+class Agent:
+    # pre-existing
+    def start_action(self, action: Action) -> Action: ...
+    def interrupt_for(self, new_action: Action) -> bool: ...
+    def cancel_action(self) -> bool: ...
+    @property
+    def is_busy(self) -> bool: ...
+
+    # added by this project
+    def should_interrupt(self, current: Action, incoming: Action) -> bool:
+        """Consulted by interrupt_for() whenever the agent is busy."""
+        return current.interruptible and incoming.priority >= current.priority
+
+    def on_idle(self, previous: Action | None) -> None:
+        """Called when an action has ended and nothing replaced it. Default: no-op."""
+```
+
+### 4.5 `HasEmitters.peek`
+
+```python
+value = model.peek("time", 0.0)   # read an Observable without registering a dependency
+```
+
+Added in [#3774](https://github.com/mesa/mesa/pull/3774). Its necessity is explained in §5.3.
+
+---
+
+## 5. Implementation
+
+### 5.1 Crossing times are solved, not sampled
+
+Because the trajectory is known in closed form, the time at which it reaches a limit is a polynomial root. A constant-rate state gives a linear solve; a state chained off another `ContinuousState` — position off speed, while speed itself changes under acceleration — gives a quadratic.
+
+```python
+# mesa/experimental/states/state.py — Threshold.recalculate
+if a == 0.0:
+    # Pure linear case
+    if v != 0.0:
+        t = (limit - current_value) / v
+        if t >= 0.0:
+            valid_times.append((t, v))
+else:
+    # Quadratic case: 0.5*a*t^2 + v*t + (x0 - limit) = 0
+    qa, qb, qc = 0.5 * a, v, current_value - limit
+    discriminant = qb**2 - 4 * qa * qc
+
+    # Allow microscopic negative discriminants from float error near tangent touches
+    if discriminant >= -np.finfo(float).eps:
+        sqrt_disc = math.sqrt(max(0.0, discriminant))
+        for t in ((-qb - sqrt_disc) / (2 * qa), (-qb + sqrt_disc) / (2 * qa)):
+            if t >= -np.finfo(float).eps:
+                t_clean = max(0.0, t)
+                # Velocity at the moment of intersection, not the velocity now
+                valid_times.append((t_clean, qb + a * t_clean))
+```
+
+The tolerance is `np.finfo(float).eps` rather than a hand-chosen constant, at a reviewer's suggestion.
+
+### 5.2 Direction filtering and edge cases
+
+`direction` is enforced against the velocity **at the root**, `v + a·t`, not against the velocity at the time of the solve:
+
+```python
+for t, v_cross in valid_times:
+    if self.direction == "rising"  and v_cross <= 0: continue
+    if self.direction == "falling" and v_cross >= 0: continue
+    if self.direction == "crossing" and v_cross == 0:
+        continue   # tangent touches bounce away rather than crossing
+```
+
+A parabola that grazes the limit and turns back has zero velocity at the touch point, so a `"crossing"` threshold correctly declines to fire — nothing crossed. Comparing against the current velocity would fire on every tangent touch.
+
+A second case is a zero-time root while the state already sits on the limit. This arises mid-callback: `brake()` assigns a new acceleration while `position == brake_point`, the assignment triggers a re-solve, and `t = 0` is a legitimate root. Scheduling at `model.time + 0` would re-fire the same threshold immediately and without bound. Such roots are rejected, with a tolerance scaled to the magnitude of the limit rather than fixed.
+
+Further cases handled in code: assignment inside a computed context raises on cyclical dependencies; an init-ordering race, in which a rate lambda reads an observable whose backing store does not yet exist mid-`Agent.__init__`, is narrowly detected and treated as at rest, while genuine errors in the rate lambda still raise.
+
+### 5.3 Reading model time without subscribing to it
+
+An early revision read `model._time` directly. The public attribute could not be substituted naively: `model.time` is itself an `Observable`, so reading it inside a rate evaluation registers the clock as a dependency of *every* trajectory. Every tick would then re-snapshot every state, decomposing each parabola into a sequence of microscopic linear segments and destroying the exactness the design exists to provide.
+
+The resolution was a public non-reactive read, `HasEmitters.peek()`, split out as [#3774](https://github.com/mesa/mesa/pull/3774) — ten lines of implementation and sixty-three of tests. [#3764](https://github.com/mesa/mesa/pull/3764) extracted `ComputedState.evaluate()` so the rate machinery had a supported entry point. Both were merged before the main pull request.
+
+### 5.4 Declarative limits
+
+An earlier API required imperative re-arming:
+
+```python
+# rejected during review
+Tram._brake_point.set_limit(self, brake_at)
+Tram._cruise.rearm(self)
+Tram._stop.rearm(self)
+```
+
+Permitting `limit` to be an `Observable`, and having `bind()` subscribe to that observable's `CHANGED` signal, reduced the above to a single assignment:
+
+```python
+self.brake_point = self.next_station - self.braking_distance()
+```
+
+This removed `set_limit()`, `rearm()`, `_get_limit()`, `limit_attr` and `fired_attr` from the public surface, and with them the failure mode in which a model omits a re-arm call and the threshold silently never fires again.
+
+### 5.5 Action lifecycle
+
+```
+                    start_requirements fail
+        PENDING ─────────────────────────────► FAILED ◄──── completion_requirements fail
+           │                                      ▲
+           │ start()                              │
+           ▼                                      │
+        ACTIVE ──── completion event fires ───────┴──────► COMPLETED
+           │  ▲
+ interrupt │  │ start() resumes
+   cancel  ▼  │
+      INTERRUPTED
+
+  COMPLETED, FAILED and INTERRUPTED all pass through Action._release_agent(),
+  which clears agent.current_action and schedules a zero-delay Priority.LOW
+  event that invokes Agent.on_idle(previous).
+
+  interrupt_for() consults Agent.should_interrupt(current, incoming) first.
+```
+
+Two independent requirement lists are provided rather than one list tested twice, because they answer different questions. A contended resource should be *claimed* at the start, and the agent's response to a failed claim — take what remains, go elsewhere, wait — is behaviour rather than a boolean gate. The completion list is for conditions that cannot be reserved: a market still open when a trade settles, a counterparty still solvent at settlement.
+
+Neither list is re-evaluated in between. Continuous revalidation would require rescanning every active action whenever the world changes, which reintroduces activity scanning. An action that must abort the moment a condition breaks is expressed as a `Threshold` invoking `cancel_action()`.
+
+```python
+class Graze(Action):
+    def __init__(self, sheep, patch):
+        super().__init__(sheep, duration=3.0,
+                         start_requirements=lambda a: patch.servings > 0)
+        self.patch = patch
+
+    def on_start(self):
+        self.patch.servings -= 1        # claimed; nobody else can take it
+
+    def on_complete(self):
+        self.agent.energy += 30
+
+    def on_fail(self):
+        self.agent.energy -= 2          # walked there for nothing
+        self.agent.look_elsewhere()
+
+
+# A condition nobody can reserve, gating the effect rather than the attempt
+Trade(trader, duration=5.0, completion_requirements=lambda a: market.open)
+```
+
+`Action.priority` was resolved at `start()` and read by nothing prior to [#3805](https://github.com/mesa/mesa/pull/3805); `git grep` on `main` found two occurrences, both writes. `should_interrupt` gives it effect:
+
+```python
+class Sheep(Agent):
+    def should_interrupt(self, current, incoming):
+        if current.name == "Flee":
+            return False                       # never stop fleeing, at any priority
+        return super().should_interrupt(current, incoming)
+
+
+sheep.start_action(Forage(sheep, priority=1.0))
+sheep.interrupt_for(Flee(sheep, priority=10.0))     # True — forage interrupted
+sheep.interrupt_for(Forage(sheep, priority=1.0))    # False — flee continues
+```
+
+The default comparison is `>=` rather than `>`. Priorities default to `0.0`, so a strict `>` would silently prevent every existing model from interrupting at all; it broke three tests already present on `main`. With `>=` the hook is a no-op for any model written before it.
+
+`on_idle` is dispatched as a zero-delay `Priority.LOW` event rather than called synchronously from `_do_complete`. This ensures a zero-duration action started from within `on_idle` cannot recurse, and that every agent finishing at time *t* decides only after all completions at *t* have run. At most one wake is delivered per agent per model time; endings that coalesce report the latest as `previous`. `Agent.remove()` cancels a pending wake, so a removed agent never wakes.
+
+```python
+class Worker(Agent):
+    def on_idle(self, previous):
+        self.start_action(Task(self, duration=1.0))
+```
+
+A known sharp edge, documented rather than hidden: a requirement that fails on **resume** is terminal. The action retains its partial progress and cannot be restarted. Returning it to `INTERRUPTED` instead would require `start()` to accept `FAILED`, which would misclassify the resume path.
+
+### 5.6 Event-list compaction
+
+Solving crossings analytically requires re-solving whenever a trajectory changes, and every re-solve cancels an event. Mesa cancels using the tombstone pattern: the cancelled event remains on the heap to preserve the heap invariant and is discarded when it surfaces. A threshold whose projected time moves repeatedly therefore grows the heap without bound. On a cancel-and-reschedule workload with 2000 agents over 800 steps, the heap peaked at 239,731 entries, of which 99.2% were tombstones.
+
+An `EventList.compact()` method had existed since [#3359](https://github.com/mesa/mesa/pull/3359), authored by souro26, and a comment in `remove()` described cancelled events as something that "may trigger adaptive compaction if they dominate the heap". No caller existed, and the merged diff contained neither a counter nor a trigger.
+
+[#3800](https://github.com/mesa/mesa/pull/3800) supplies both:
+
+```python
+class EventList:
+    COMPACTION_RATIO: float = 0.25    # bounds the peak heap at L / (1 - RATIO)
+
+    def _on_cancellation(self) -> None:
+        self._n_canceled += 1
+        if self._n_canceled > len(self._events) * self.COMPACTION_RATIO:
+            self.compact()
+
+    def __len__(self) -> int:
+        return len(self._events) - self._n_canceled     # O(1), was a full scan
+```
+
+The check hangs off `cancel()` rather than `add_event` or `pop_event` because cancellation is the only operation that *adds* dead weight, and therefore the only point at which a heap can newly exceed the threshold. Placing it in `pop_event` — the position proposed by the original design sketch — pays the cost on the hot path.
+
+Tracking the count requires a back-reference from each event to its list, because `Event.cancel()` is invoked directly on the event by `Action`, `Threshold` and `EventGenerator` and never routes through the list. The reference is **weak**, set in `add_event` and cleared on pop: an event that has left the heap must not be counted against it, and events must not keep a dead list alive.
+
+`is_empty()` and `peek_ahead()` inherit the O(1) length.
+
+The ratio was selected by measurement. An initial value of 0.5 was replaced with 0.25 after a sweep over an 800-agent workload, posted in the review thread. The same sweep showed that a `COMPACTION_FLOOR` constant earned nothing above roughly 192 live events, and it was removed.
+
+**Stated precisely:** popping a *live* event also raises the instantaneous ratio, since it shrinks the heap without removing a tombstone, so the heap can sit above the ratio between cancellations. The guarantee provided is a bound on accumulated dead weight — tombstones arise only at cancellation, and every cancellation is checked — not that the ratio is never momentarily exceeded. This is sufficient for the memory bound the workload requires.
+
+---
+
+## 6. Worked example: the tram route model
+
+Added in [#3796](https://github.com/mesa/mesa/pull/3796). A single tram runs an ordered route of stations. On departure it accelerates at a fixed rate; on reaching cruise speed it coasts; at an analytically computed brake point it decelerates; on reaching zero speed it has arrived, dwells, and departs for the next station. **Every one of those transitions is a threshold crossing, and the agent defines no `step()` method.**
+
+### 6.1 Agent
+
+```python
+# mesa/examples/experimental/tram_model/agents.py
+import math
+
+from mesa import Agent, Model
+from mesa.experimental.mesa_signals import HasEmitters, Observable
+from mesa.experimental.states import ContinuousState, Threshold
+
+
 class Tram(Agent, HasEmitters):
     acceleration = Observable(fallback_value=0.0)
     speed        = ContinuousState(fallback_value=0.0, rate=lambda a: a.acceleration)
-    position     = ContinuousState(fallback_value=0.0, rate=lambda a: a.speed)   # chained
+    position     = ContinuousState(fallback_value=0.0, rate=lambda a: a.speed)
     brake_point  = Observable(fallback_value=float("inf"))
     cruise_speed = Observable(fallback_value=15.0)
 
-    _cruise_threshold  = Threshold(state=speed,    limit=cruise_speed,
-                                   callback="start_coasting",   direction="rising")
-    _braking_threshold = Threshold(state=position, limit=brake_point,
-                                   callback="brake",            direction="rising")
-    _stop_threshold    = Threshold(state=speed,    limit=0.0,
-                                   callback="arrive_at_station", direction="falling")
+    # Threshold names must not collide with the private backing attribute of any
+    # Observable they read: a Threshold called _brake_point would be found by the
+    # lookup of brake_point's own "_brake_point" store and silently shadow it.
+    _cruise_threshold = Threshold(
+        state=speed, limit=cruise_speed, callback="start_coasting", direction="rising"
+    )
+    _braking_threshold = Threshold(
+        state=position, limit=brake_point, callback="brake", direction="rising"
+    )
+    _stop_threshold = Threshold(
+        state=speed, limit=0.0, callback="arrive_at_station", direction="falling"
+    )
 
-    def depart(self):
+    def __init__(self, model, route, cruise_speed=15.0, acceleration_rate=2.0,
+                 deceleration_rate=3.0, dwell_time=5.0):
+        super().__init__(model)
+        if len(route) < 2:
+            raise ValueError("route must contain at least a start and one destination")
+
+        self.route = route
+        self.acceleration_rate = acceleration_rate
+        self.deceleration_rate = deceleration_rate
+        self.dwell_time = dwell_time
+        self._segment_index = 1
+
+        # The limits the thresholds read must exist before the first
+        # ContinuousState assignment, which is what binds the thresholds.
+        self.brake_point = float("inf")
+        self.cruise_speed = cruise_speed
+
+        self.acceleration = 0.0
+        self.speed = 0.0
+        self.position = route[0]
+
+    @property
+    def next_station(self) -> float:
+        return self.route[self._segment_index]
+
+    @property
+    def route_complete(self) -> bool:
+        return self._segment_index >= len(self.route)
+
+    def peak_speed(self) -> float:
+        """Highest speed reachable before braking must begin.
+
+        On a long segment this is the cruise speed. On a short one the tram runs
+        out of room first and the profile is triangular: it accelerates to
+        v = sqrt(2d / (1/a + 1/b)) and brakes from there, never coasting.
+        """
+        distance = self.next_station - self.position
+        triangular = math.sqrt(
+            2.0 * distance
+            / (1.0 / self.acceleration_rate + 1.0 / self.deceleration_rate)
+        )
+        return min(self.cruise_speed, triangular)
+
+    def braking_distance(self) -> float:
+        return self.peak_speed() ** 2 / (2.0 * self.deceleration_rate)
+
+    # ---- threshold callbacks -------------------------------------------
+    def depart(self) -> None:
         self.brake_point = self.next_station - self.braking_distance()
         self.acceleration = self.acceleration_rate
 
-    def start_coasting(self):
+    def start_coasting(self) -> None:
         self.acceleration = 0.0
 
-    def brake(self):
+    def brake(self) -> None:
         self.brake_point = float("inf")
         self.acceleration = -self.deceleration_rate
+
+    def arrive_at_station(self) -> None:
+        self.acceleration = 0.0
+        self._segment_index += 1
+        if self.route_complete:
+            return
+        self.model.schedule_event(self.depart, after=self.dwell_time)
 ```
 
-`brake_point` is an `Observable`, not a constant, so assigning to it re-solves the threshold. There's no `rearm()` call — that's the point, and I'll come back to why.
+Assigning to `brake_point` in `depart()` is sufficient to re-solve `_braking_threshold`; no re-arming call exists. The brake point is derived from the segment's **peak** speed rather than the cruise speed, because on a short segment the tram never reaches cruise: assuming otherwise places the brake point outside the segment, and a rising threshold that begins already past its limit never fires at all.
 
-Here's what it actually does, from running the merged example ([PR #3796](https://github.com/mesa/mesa/pull/3796)):
+### 6.2 Model
 
-![Tram speed and position over 75 seconds, with the exact threshold crossing times marked](img-1-tram-trajectory.png)
+```python
+# mesa/examples/experimental/tram_model/model.py
+class TramScenario(Scenario):
+    n_stations: int = 20
+    station_spacing: float = 200.0
+    cruise_speed: float = 15.0
+    acceleration_rate: float = 2.0
+    deceleration_rate: float = 3.0
+    dwell_time: float = 5.0
 
-The tram coasts at 7.5 s, brakes at 14.583333 s, arrives at 19.583333 s. That last one is 175/12 — a time no integer tick would ever land on. It stops at exactly 200.0000 m, dwells for exactly 5 s, and does it again.
 
-## Why "exact" is worth caring about
+class TransitSystem(Model):
+    def __init__(self, scenario: TramScenario = TramScenario):
+        super().__init__(scenario=scenario)
 
-I wrote a plain forward-Euler loop that polls its thresholds every tick — the code this API replaces — and ran it on the same segment. That loop lives in [`make_figures.py`](make_figures.py) in this repo; it isn't Mesa and it isn't a Mesa benchmark. It's there so the numbers are checkable.
+        self.route = [scenario.station_spacing * i
+                      for i in range(int(scenario.n_stations))]
 
-![Zoom on the arrival: every polled tick overshoots the platform, the analytic solve lands on it](img-2-polling-vs-exact.png)
+        self.tram = Tram(self, route=self.route,
+                         cruise_speed=scenario.cruise_speed,
+                         acceleration_rate=scenario.acceleration_rate,
+                         deceleration_rate=scenario.deceleration_rate,
+                         dwell_time=scenario.dwell_time)
 
-| Method | Arrival detected | Time error | Stops at | Position error |
+        self.recorder = DataRecorder(self)
+        self.data_registry.track_agents(
+            self.agents, "tram_data", ["position", "speed", "acceleration"]
+        ).record(self.recorder)
+
+        # The tram is idle until told to leave the first station. Scheduling the
+        # departure rather than calling it directly keeps every state change on
+        # the event queue, so model.time is meaningful from the very first entry.
+        self.schedule_event(self.tram.depart, at=0.0)
+
+    def step(self) -> None:
+        """Sample the tram's continuous states once per time unit.
+
+        The tram needs no per-step logic: its speed and position are extrapolated
+        analytically and its transitions fire from the event queue. This exists
+        purely to feed the DataCollector behind the plots.
+        """
+        self.datacollector.collect(self)
+```
+
+Deleting `TransitSystem.step` produces byte-identical arrival times. It samples for the plots; it does not drive the model.
+
+### 6.3 Running it
+
+```console
+$ pip install "mesa[rec]"
+$ solara run mesa/examples/experimental/tram_model/app.py   # interactive
+$ python mesa/examples/experimental/tram_model/model.py     # trace to stdout
+```
+
+### 6.4 Output
+
+![Tram speed and position over 75 seconds of model time, with the exact threshold crossing times marked](img-1-tram-trajectory.png)
+
+With `cruise_speed=15.0`, `acceleration_rate=2.0`, `deceleration_rate=3.0` and 200 m spacing, the first segment produces:
+
+| Event | Model time | Position | Speed |
+|---|---:|---:|---:|
+| `depart` | 0.000000 s | 0.0000 m | 0.0000 m/s |
+| `start_coasting` | 7.500000 s | 56.2500 m | 15.0000 m/s |
+| `brake` | 14.583333 s | 162.5000 m | 15.0000 m/s |
+| `arrive_at_station` | 19.583333 s | 200.0000 m | 0.0000 m/s |
+
+The arrival time is 175/12 — a value no integer tick grid contains. These figures are asserted exactly in `tests/experimental/test_states.py::TestDemoIntegration::test_demo_scenario_end_to_end`.
+
+---
+
+## 7. Evaluation
+
+### 7.1 Exactness against a polling loop
+
+The comparison below integrates the same segment with a forward-Euler loop that polls its thresholds every tick — the construction this API replaces. That loop is implemented in [`make_figures.py`](make_figures.py) in this repository; it is not part of Mesa and is not a Mesa benchmark. It is included so the figures are reproducible.
+
+![Zoom on the arrival: every polled tick overshoots the platform; the analytic solve terminates on it](img-2-polling-vs-exact.png)
+
+| Method | Arrival detected | Time error | Stopping position | Position error |
 |---|---:|---:|---:|---:|
 | Polling, 1.0 s tick | 21.000 s | +1.417 s | 219.0000 m | **+19.00 m** |
 | Polling, 0.5 s tick | 20.000 s | +0.417 s | 206.2500 m | +6.25 m |
@@ -103,81 +574,107 @@ I wrote a plain forward-Euler loop that polls its thresholds every tick — the 
 | Polling, 0.1 s tick | 19.700 s | +0.117 s | 202.6700 m | +2.67 m |
 | `ContinuousState` + `Threshold` | 19.583333 s | — | 200.0000 m | **0.00 m** |
 
-At a one-second tick the tram sails 19 metres past the platform. Shrinking the tick costs linearly more work and never reaches zero error — and notice the 0.1 s row is *worse* than 0.25 s, because error accumulation isn't monotonic in step size. That's the kind of thing that's very annoying to discover in a model you've already published results from.
+Reducing the tick incurs linear additional work and does not converge to zero error. The 0.1 s row is worse than the 0.25 s row, error accumulation not being monotonic in step size.
 
----
-
-## The action layer
-
-**This part is built on someone else's work and I want that stated up front.** The `Action` primitive — the lifecycle, `start_action`, `interrupt_for`, `cancel_action`, the `on_start`/`on_complete`/`on_interrupt` hooks — is Ewout ter Hoeven's, from [PR #3461](https://github.com/mesa/mesa/pull/3461) (+1388 lines). `git blame` on `actions.py` puts 334 lines with him and 127 with me.
-
-What I added, in three stacked PRs tracked by [issue #3798](https://github.com/mesa/mesa/issues/3798):
-
-**Actions can fail now.** ([#3801](https://github.com/mesa/mesa/pull/3801)) Before this, an action could only succeed. A sheep starts foraging, the completion event is scheduled immediately, and five time units later `on_complete()` fires and the sheep gains energy whether or not the grass is still there. The workaround was re-checking inside `on_complete()` and returning early — the same guard copy-pasted into every action, and the action still ends up `COMPLETED` having accomplished nothing.
-
-So: two predicate lists and a fifth state. `start_requirements` gates entry, checked *before* duration and priority resolve, so a failing action fires no `on_start()` and schedules no completion event. `completion_requirements` gates the effect at completion time. A failure moves to `ActionState.FAILED` and calls `on_fail()`.
-
-They're two separate lists rather than one list checked twice because they answer different questions. A rival resource should be *claimed* at the start — and what the agent does when the claim fails (take what's left, go elsewhere, wait) is behaviour, not a boolean. The completion list is for things nobody can reserve: a market still open when a trade lands, a counterparty still solvent at settlement.
-
-Neither is re-checked in between, deliberately. Continuously revalidating every active action means rescanning the world on every change, which is activity scanning wearing a different hat. An action that must abort the instant a condition breaks belongs to a `Threshold` calling `cancel_action()`.
-
-**`Action.priority` does something now.** ([#3805](https://github.com/mesa/mesa/pull/3805)) It was resolved at `start()` and read by nothing. `git grep` on `main` found two occurrences, both writes. A priority-1 action would happily preempt a priority-100 one, and the release notes advertised the feature. I added `Agent.should_interrupt(current, incoming)`, defaulting to `current.interruptible and incoming.priority >= current.priority`.
-
-`>=` rather than `>` because priorities default to `0.0`, so a strict `>` would silently stop existing models from interrupting at all — it broke three tests that were already on `main`. Choosing `>=` made the new hook a no-op for every model written before it.
-
-**Agents get told when they're free.** ([#3833](https://github.com/mesa/mesa/pull/3833) — **still open, not merged**) `Agent.on_idle(previous)` fires when an action ends and nothing replaces it. It's dispatched as a zero-delay `Priority.LOW` event rather than called synchronously, so a zero-duration action started from inside `on_idle` can't recurse, and every agent finishing at time *t* decides after all completions at *t* have run.
-
-The action test suite went from 61 tests to 101 across the three.
-
----
-
-## Paying for it
-
-Solving crossings analytically means re-solving whenever a trajectory changes, and every re-solve cancels an event. Mesa cancels with tombstones — the dead event stays on the heap to preserve the heap invariant and gets discarded when it surfaces. So a threshold whose projected time keeps moving grows the heap without bound. On a cancel-and-reschedule workload with 2000 agents over 800 steps, the heap peaked at 239,731 entries, 99.2% of them tombstones.
-
-A `compact()` method had existed since [#3359](https://github.com/mesa/mesa/pull/3359) (souro26's work, not mine) and a comment in `remove()` already described cancelled events as something that "may trigger adaptive compaction if they dominate the heap". Nothing in the library ever called it.
-
-[#3800](https://github.com/mesa/mesa/pull/3800) wired it up:
+### 7.2 Event-list compaction
 
 ![Peak heap and wall time, before and after adaptive compaction](img-3-compaction.png)
 
-Peak memory at 1000 agents drops from 29.0 MB to 1.3 MB. The same counter makes `__len__` O(1) instead of a scan of the whole heap — 2.6 ms to 0.12 µs at 50k events — which `is_empty()` and `peek_ahead()` inherit for free.
+| Workload | Wall time before | after | Peak heap before | after |
+|---|---:|---:|---:|---:|
+| 200 agents | 0.12 s | 0.11 s | 14,256 | 399 |
+| 1000 agents | 1.66 s | 0.97 s | 89,379 | 2,001 |
+| 2000 agents | 15.37 s | 5.26 s | 239,731 | 4,000 |
 
-The interesting design question was *where to put the check*. It hangs off `cancel()`, not `add_event` or `pop_event`, because cancelling is the only operation that *adds* dead weight — the only point at which a heap can newly go past the threshold. Putting it in `pop_event`, which is the obvious place and what the original sketch proposed, means paying for it on the hot path.
+Peak memory at 1000 agents falls from 29.0 MB to 1.3 MB. `len()` on a 50,000-event list falls from 2.6 ms to 0.12 µs.
 
-I'll be honest that the neat version of that argument is a bit too neat: popping a *live* event does raise the instantaneous ratio, since it shrinks the heap without removing a tombstone, so a heap can sit above the ratio between cancellations. What the cancel-side check actually guarantees is a bound on accumulated dead weight, not that the ratio is never momentarily exceeded. That's enough for the memory bound, which is what the workload needed.
+These are the author's own measurements on a single machine, as reported in the body of [#3800](https://github.com/mesa/mesa/pull/3800), and should be read as such rather than as an independent audit. The benchmark script and the ratio sweep are in that pull request's thread.
 
-The ratio itself was picked by measurement, not taste. I shipped 0.5 first; a reviewer asked for the evidence, so I ran a sweep on an 800-agent workload and posted the table in review. Peak heap is bounded by `L / (1 − ratio)`. 0.25 gave the best balance, and the same sweep showed a `COMPACTION_FLOOR` constant I'd added earned nothing above ~192 live events. So it came out — a tuning knob deleted rather than added.
+### 7.3 Limits of applicability
 
-**Where this doesn't help:** at 200 agents the timing difference is inside the noise; the win there is purely memory. And the whole approach loses when nearly every agent crosses a threshold on nearly every tick, because then the solver runs as often as the poll would have and the event machinery is pure overhead. Continuous state pays off when transitions are *rare relative to ticks* — transit, logistics, physiology. Not a lattice model where every cell updates every step.
+At 200 agents the timing difference is within noise; the benefit at that scale is memory alone.
 
----
+More generally the approach is unfavourable when nearly every agent crosses a threshold on nearly every tick: the solver then runs as often as the poll would have, and the event machinery is pure overhead. Continuous state is advantageous when transitions are rare relative to ticks — transit, logistics and physiological models — and not in, for example, a lattice model in which every cell updates every step.
 
-## The part where I built the wrong thing
+### 7.4 Tests
 
-My first two attempts — [#3754](https://github.com/mesa/mesa/pull/3754) and [#3755](https://github.com/mesa/mesa/pull/3755), both closed unmerged — built a columnar NumPy backend: a `StateTensor` holding every agent's continuous state in pre-allocated arrays, plus a `ContinuousScheduler` keeping a single master event at the global-minimum crossing.
+| Suite | Tests | Attribution |
+|---|---:|---|
+| `tests/experimental/test_states.py` | 24 | all added by this project |
+| `tests/experimental/test_actions.py` | 101 | 61 pre-existing, 40 added by this project |
+| `tests/time/test_events.py` — compaction | 13 | added by this project |
 
-The motivation was real. I'd measured a Sugarscape model producing over 600,000 tombstone events by step 300 when deaths were threshold-driven. One master event makes that number one. And the CI benchmark bot was emphatic: Sugarscape run time down 78%.
-
-![The CI benchmark on the abandoned PR: one green column, three red ones](img-4-false-start.png)
-
-That's the same benchmark comment. I read the first bar and not the other three.
-
-Every model paid for the tensor — it was allocated in every `Model.__init__` at a fixed capacity of 10,000 rows, so models that never touch a continuous state got 148% and 169% slower to construct. Past 10,000 agents it raised `MemoryError`. Ewout's summary was that it amounted to "a second runtime running alongside Mesa's existing one", and that the target should be "80% of the use-cases with 20% of the complexity". Jan pointed out that Sugarscape was the wrong model to design against in the first place — a tram simulation, where cancellation is rare, needs no tensor at all. I'd picked the workload that flattered my architecture.
-
-I closed #3755 with one line — "closing in favour of #3766" — and rebuilt on top of `mesa_signals` and the existing event queue. The merged design allocates nothing per model; its benchmark run shows init times flat or slightly improved across the board.
-
-The tombstone problem didn't go away by being ignored. It just stopped being an excuse for a parallel runtime, and got a targeted fix four weeks later in 78 lines of `events.py`.
-
-**Two other things didn't ship as proposed.** My March prototype had a `DecisionSystem` — a declarative rules engine where you registered conditions and priorities and it chose the agent's next action. I didn't drop it; Jan rejected it, on the grounds that Mesa shouldn't force a finite-state-machine style of logic on modellers. Arguing it through, I came round: a rules engine that re-evaluates every agent's rules to decide what's next is activity scanning again, which is the thing the project was supposed to remove. I also withdrew `Task`/`TaskManager` in August, on the narrower ground that nothing meaningfully distinguished them from the `Action` class that already existed.
-
-So two of my three proposed pillars didn't ship under their proposed names. That's a real scope reduction against what I pitched in March, and I'd rather say so than quietly redefine what was promised.
+Mesa's CI additionally enforces `ruff` with the Google docstring convention, treats warnings as errors, and rejects coverage regressions.
 
 ---
 
-## The trail — this project
+## 8. Alternatives considered and rejected
 
-| PR | What | Diff | State |
+### 8.1 A columnar tensor backend
+
+[#3754](https://github.com/mesa/mesa/pull/3754) and [#3755](https://github.com/mesa/mesa/pull/3755), both closed unmerged, implemented a columnar NumPy backend: a `StateTensor` holding every agent's continuous state in pre-allocated arrays, and a `ContinuousScheduler` maintaining a single master event at the global-minimum projected crossing.
+
+The motivation was measured: a Sugarscape model produced over 600,000 tombstone events by step 300 when deaths were threshold-driven, and a single master event reduces that count to one. The CI benchmark reported Sugarscape run time down 78%.
+
+![CI benchmark on the abandoned pull request: one improved column and three regressed ones](img-4-false-start.png)
+
+The design was rejected on three grounds, all correct:
+
+1. The tensor was allocated in every `Model.__init__` at a fixed capacity of 10,000 rows. The same benchmark run that reported the 78% improvement also reported model initialisation 148% and 169% slower for models that never touch a continuous state. Ewout ter Hoeven characterised the result as "a second runtime running alongside Mesa's existing one", and set the target as "80% of the use-cases with 20% of the complexity".
+2. Beyond 10,000 agents it raised `MemoryError`.
+3. Jan Kwakkel observed that Sugarscape was the wrong model to design against: a tram simulation, in which cancellation is rare, requires no tensor at all. The benchmark model had been selected in a way that flattered the architecture.
+
+[#3755](https://github.com/mesa/mesa/pull/3755) was closed in favour of [#3766](https://github.com/mesa/mesa/pull/3766) and the design rebuilt on `mesa_signals` and the existing event queue. The merged implementation allocates nothing per model, and its benchmark run shows initialisation times flat or marginally improved across all five benchmark models.
+
+The tombstone problem was addressed separately four weeks later in 78 lines of `events.py` (§5.6), rather than by a parallel runtime.
+
+### 8.2 A declarative rules engine
+
+The March prototype ([discussion #3428](https://github.com/mesa/mesa/discussions/3428)) proposed three components: `BehavioralState`, a `Task`/`TaskManager` pair, and a `DecisionSystem` — a rules engine in which conditions and priorities were registered and the framework selected the agent's next action.
+
+`DecisionSystem` was rejected by Jan Kwakkel on the grounds that Mesa should not impose a finite-state-machine style of logic on model authors. The objection is consistent with the project's own premise: a rules engine that re-evaluates every agent's rule set to determine the next action is activity scanning, which is what the project set out to remove. The replacement is narrower — an agent wakes on a threshold or on `on_idle` and decides in ordinary Python; the framework schedules but does not choose.
+
+### 8.3 `Task` and `TaskManager`
+
+Withdrawn in August on the narrower ground that nothing meaningfully distinguished them from the existing `Action` class.
+
+Two of the three originally proposed components therefore did not ship under their proposed names. This is a reduction in scope relative to the March proposal and is recorded as such.
+
+---
+
+## 9. Current state on `main`
+
+- `from mesa.experimental.states import ContinuousState, Threshold` is available. 492 lines, 24 tests. Experimental namespace; no semantic-versioning guarantee.
+- `Action` accepts `start_requirements` and `completion_requirements`, exposes `ActionState.FAILED` and `on_fail()`, and `Agent.should_interrupt` gates every preemption.
+- **`Agent.on_idle` is not yet merged** — see [#3833](https://github.com/mesa/mesa/pull/3833).
+- `EventList` compacts adaptively and `len()` is O(1). This is in stable `mesa/time/` and applies to every model that cancels events.
+- `solara run mesa/examples/experimental/tram_model/app.py` runs the worked example.
+- **No narrative documentation exists.** Docstrings are complete; the guide pages are not written.
+
+Three pull requests touch stable modules (`mesa/time/events.py`, `mesa/agent.py`); the remainder are under `mesa/experimental/`. Defaults in the stable modules were chosen so that no model written before this work behaves differently after it.
+
+---
+
+## 10. Outstanding work
+
+| Item | Status |
+|---|---|
+| [#3833](https://github.com/mesa/mesa/pull/3833) — `Agent.on_idle` | Open, awaiting first review. Stacked on #3805. |
+| Narrative documentation for both wake sources | Not started (§5 of [#3798](https://github.com/mesa/mesa/issues/3798)) |
+| User-space "resume the remainder" recipes | Not started |
+| Task-driven example under `mesa/examples/experimental/` | Not started |
+| Slot cardinality — should an agent have exactly one action slot? | Open design question, recorded in #3798 |
+| Placement — core `Agent` or an experimental mixin? | Open design question, recorded in #3798 |
+| `_find_chained_rate` depth | Looks exactly one link deep. A three-deep chain under-integrates rather than raising; no test covers this. |
+| General ODE support | Not attempted. Would require a numerical integrator and would cost `Threshold` its exact analytic crossing time, substituting bisection on the integrator's output. |
+
+---
+
+## 11. Contribution record
+
+### 11.1 This project
+
+| PR | Description | Diff | State |
 |---|---|---:|---|
 | [#3482](https://github.com/mesa/mesa/pull/3482) | Diffing engine for dependency autodiscovery in `mesa_signals` | +32 / −17 | merged |
 | [#3754](https://github.com/mesa/mesa/pull/3754) | First attempt: `ContinuousState` on a tensor backend | +567 / −4 | closed |
@@ -187,47 +684,33 @@ So two of my three proposed pillars didn't ship under their proposed names. That
 | [#3785](https://github.com/mesa/mesa/pull/3785) | Add the `examples/experimental/` tier | +14 / −7 | merged |
 | [#3788](https://github.com/mesa/mesa/pull/3788) | Generate Read the Docs pages for the new tier | +8 / −14 | merged |
 | **[#3766](https://github.com/mesa/mesa/pull/3766)** | **`ContinuousState` and `Threshold`** | **+938 / −0** | **merged** |
-| [#3796](https://github.com/mesa/mesa/pull/3796) | Tram route model — a worked example with no agent `step()` | +702 / −0 | merged |
+| [#3796](https://github.com/mesa/mesa/pull/3796) | Tram route model — worked example with no agent `step()` | +702 / −0 | merged |
 | [#3800](https://github.com/mesa/mesa/pull/3800) | Adaptive event-list compaction and O(1) `__len__` | +293 / −2 | merged |
 | [#3801](https://github.com/mesa/mesa/pull/3801) | Requirement lists and an `ActionState.FAILED` path | +376 / −8 | merged |
-| [#3805](https://github.com/mesa/mesa/pull/3805) | `Agent.should_interrupt`, giving `Action.priority` its first effect | +181 / −21 | merged |
-| [#3833](https://github.com/mesa/mesa/pull/3833) | `Agent.on_idle` as a deferred low-priority wake | +263 / −22 | **open, awaiting review** |
+| [#3805](https://github.com/mesa/mesa/pull/3805) | `Agent.should_interrupt`, giving `Action.priority` effect | +181 / −21 | merged |
+| [#3833](https://github.com/mesa/mesa/pull/3833) | `Agent.on_idle` as a deferred low-priority wake | +263 / −22 | **open** |
 
-Three of those touch stable modules (`mesa/time/events.py`, `mesa/agent.py`); the rest are under `mesa/experimental/`, which carries no semver guarantee. The defaults in the stable ones were chosen so no model written before this work behaves differently after it.
+### 11.2 Tracking issue
 
-Two enabling PRs came out of review pressure and are worth a note, because neither was in my plan. The branch originally reached into `model._time` privately, and a reviewer asked why it couldn't read the public attribute. The answer turned out to be the interesting bit: `model.time` is itself an `Observable`, so reading it inside a rate evaluation registers the clock as a dependency of *every* trajectory — and then every tick re-snapshots every state, shattering the parabolas into microscopic linear segments. The fix needed a way to read an `Observable` without subscribing to it, which became `peek()` in #3774. Ten lines of implementation, sixty-three of test, and the main PR couldn't land cleanly without it.
+The action strand is tracked in [#3798](https://github.com/mesa/mesa/issues/3798), opened 13 August: five sections, fourteen checkboxes, seven complete.
 
-The bigger change also came from review. The example originally read `Tram._brake_point.set_limit(self, brake_at); Tram._cruise.rearm(self)` and Jan asked, reasonably, what was going on there. Letting `limit` accept an `Observable` and having `bind()` subscribe to *its* `CHANGED` signal deleted `set_limit()`, `rearm()` and three more methods, and collapsed those three calls into one assignment. It also deleted the entire class of bug where a model forgets to re-arm and the threshold silently never fires again. Smaller API, fewer ways to hold it wrong — and it wasn't my idea first.
-
----
-
-## The tracking issue
-
-The action half of this project is tracked in **[issue #3798](https://github.com/mesa/mesa/issues/3798)**, which I opened on 13 August. It's a status document rather than a discussion — five sections, fourteen checkboxes, and it says plainly which are done and which aren't.
-
-| Section | What it covers | Status |
+| Section | Covers | Status |
 |---|---|---|
-| 1. Event list — `mesa.time` | Adaptive compaction, tombstone counter, O(1) `__len__` | Done — [#3800](https://github.com/mesa/mesa/pull/3800) |
-| 2. Action primitives | Requirement lists, `ActionState.FAILED` and `on_fail()`, give `priority` an effect | Done — [#3801](https://github.com/mesa/mesa/pull/3801), [#3805](https://github.com/mesa/mesa/pull/3805) |
-| 3. Wake contract | `Agent.on_idle`, deferred `Priority.LOW` dispatch, same-time coalescing, cancel the wake on `Agent.remove()` | Written, awaiting review — [#3833](https://github.com/mesa/mesa/pull/3833) |
-| 4. Preemption | `Agent.should_interrupt`, consulted by `interrupt_for()` | Done — [#3805](https://github.com/mesa/mesa/pull/3805) |
-| 5. Docs and examples | Document both wake sources, user-space "resume the remainder" recipes, a task-driven example | **Not started** |
+| 1. Event list — `mesa.time` | Adaptive compaction, tombstone counter, O(1) `__len__` | Complete — [#3800](https://github.com/mesa/mesa/pull/3800) |
+| 2. Action primitives | Requirement lists, `ActionState.FAILED`, `on_fail()`, give `priority` effect | Complete — [#3801](https://github.com/mesa/mesa/pull/3801), [#3805](https://github.com/mesa/mesa/pull/3805) |
+| 3. Wake contract | `Agent.on_idle`, deferred dispatch, same-time coalescing, cancel on `remove()` | Under review — [#3833](https://github.com/mesa/mesa/pull/3833) |
+| 4. Preemption | `Agent.should_interrupt` | Complete — [#3805](https://github.com/mesa/mesa/pull/3805) |
+| 5. Docs and examples | Both wake sources documented, resume recipes, task-driven example | Not started |
 
-Seven of the fourteen boxes are ticked. The issue also carries the two design questions I couldn't settle on my own — whether an agent should have exactly one action slot, and whether the whole action cluster belongs on core `Agent` or behind an experimental mixin — recorded as open decisions rather than quietly resolved in a direction nobody agreed to.
+A prior tracking issue, [#3209](https://github.com/mesa/mesa/issues/3209), served the same function for the `AgentSet` refactor in January.
 
-I'd opened one tracking issue before, [#3209](https://github.com/mesa/mesa/issues/3209), for the `AgentSet` refactor in January. Splitting a design across several PRs and keeping the status in one public place worked well enough there that I did it again.
+### 11.3 Prior contributions to Mesa
 
----
+First pull request merged 18 December 2025, three months before GSoC applications opened. **64 pull requests opened, 48 merged**, +7,518 / −2,115 lines across the merged set. Between December and May, Mesa merged 268 pull requests from all authors; 38 were from this contributor, the second-highest count over that period.
 
-## Everything else I've done in Mesa
+The thirteen listed in §11.1 constitute the GSoC project. The remainder follow, grouped by subsystem.
 
-This project isn't where I started. My first PR merged on 18 December 2025, three months before GSoC applications opened, and by the time coding began I'd already spent five months in the parts of the codebase this project depends on. That mattered more than the proposal did.
-
-**64 pull requests opened, 48 merged** — +7,518 / −2,115 lines across the merged ones. Between December and May, Mesa merged 268 PRs from all authors; 38 of them were mine, the second-highest count in the repository over that window.
-
-The thirteen above are the GSoC project. Here is the rest, grouped by what it touched.
-
-### Reactive signals — `mesa_signals`
+#### Reactive signals — `mesa_signals`
 
 The observable/computed layer the continuous-state work is built on. I spent the winter fixing and speeding it up, which is the only reason I knew it well enough to build on it later.
 
@@ -239,7 +722,7 @@ The observable/computed layer the continuous-state work is built on. I spent the
 | [#3462](https://github.com/mesa/mesa/pull/3462) | Add static dependency injection to `@computed_property` for `@emit` support | +163 / −42 | merged |
 | [#3486](https://github.com/mesa/mesa/pull/3486) | Fixes a cache-invalidation bug for `SignalingList` | +43 / −5 | merged |
 
-### Agent storage — `AgentSet`
+#### Agent storage — `AgentSet`
 
 Mesa held its agents in weak-referenced sets, which cost lookup time on the hottest path in the framework. This introduced an abstract base and a strong-keyed variant underneath it, then switched `Model` over. Tracked in issue #3209.
 
@@ -252,7 +735,7 @@ Mesa held its agents in weak-referenced sets, which cost lookup time on the hott
 | [#3224](https://github.com/mesa/mesa/pull/3224) | Update `model.py` to replace `AgentSet` with `_HardKeyAgentSet` | +54 / −19 | merged |
 | [#3448](https://github.com/mesa/mesa/pull/3448) | Micro-optimisations in agent and agentset | +10 / −10 | closed |
 
-### Data collection — `DataRecorder`
+#### Data collection — `DataRecorder`
 
 A reactive alternative to the legacy `DataCollector`: datasets that subscribe to signals instead of being polled once per step, with memory, JSON, parquet and SQL backends. The single largest thing I've added to Mesa.
 
@@ -265,7 +748,7 @@ A reactive alternative to the legacy `DataCollector`: datasets that subscribe to
 | [#3424](https://github.com/mesa/mesa/pull/3424) | Add explicit `RUN_ENDED` signal for terminal data handling in `DataRecorder` | +129 / −29 | merged |
 | [#3579](https://github.com/mesa/mesa/pull/3579) | Fix empty batch_run results when model_reporters is None | +38 / −2 | merged |
 
-### Discrete spaces and the removal of `PropertyLayer`
+#### Discrete spaces and the removal of `PropertyLayer`
 
 `PropertyLayer` was a wrapper class around what was already a NumPy array. Four PRs replaced it with the array itself and then deleted the module, net −536 lines. Separately, cells learned to distinguish their logical index from their physical position, which is what made network layouts drawable.
 
@@ -281,7 +764,7 @@ A reactive alternative to the legacy `DataCollector`: datasets that subscribe to
 | [#3387](https://github.com/mesa/mesa/pull/3387) | Convert DiscreteSpace to an Abstract Base Class | +14 / −10 | merged |
 | [#3432](https://github.com/mesa/mesa/pull/3432) | Delete property_layer.py | +0 / −446 | merged |
 
-### Continuous space
+#### Continuous space
 
 Allocation and removal on the hot path, plus two attempts at pathfinding over stacked spaces that I did not land.
 
@@ -292,7 +775,7 @@ Allocation and removal on the hot path, plus two attempts at pathfinding over st
 | [#3556](https://github.com/mesa/mesa/pull/3556) | Refactor _add_agent in ContinuousSpace | +11 / −11 | merged |
 | [#3678](https://github.com/mesa/mesa/pull/3678) | Pathfinding for Stacked Space | +180 / −7 | closed |
 
-### Visualisation
+#### Visualisation
 
 Mostly consequences of the space work above — drawers and the network renderer had to follow the cell-position change.
 
@@ -304,7 +787,7 @@ Mostly consequences of the space work above — drawers and the network renderer
 | [#3344](https://github.com/mesa/mesa/pull/3344) | Remove `model.steps` usage from solara_viz | +1 / −1 | merged |
 | [#3345](https://github.com/mesa/mesa/pull/3345) | Update `Network` to use `Cell.position` and `layout` for Visualisation | +37 / −180 | merged |
 
-### Benchmarks
+#### Benchmarks
 
 The harness compares timings across commits, so it has to be trustworthy before anything else is. Warm-up runs, `gc` disabled around the timed loop, and every example moved onto `Scenario`.
 
@@ -314,7 +797,7 @@ The harness compares timings across commits, so it has to be trustworthy before 
 | [#3203](https://github.com/mesa/mesa/pull/3203) | Make benchmarking more robust | +21 / −5 | merged |
 | [#3314](https://github.com/mesa/mesa/pull/3314) | Use scenario for all examples in benchmarks | +209 / −126 | merged |
 
-### Core correctness and cleanup
+#### Core correctness and cleanup
 
 Reproducibility and lifecycle bugs, mostly found while doing something else.
 
@@ -326,7 +809,7 @@ Reproducibility and lifecycle bugs, mostly found while doing something else.
 | [#3298](https://github.com/mesa/mesa/pull/3298) | Revert "Add a signal at start of run (#3284)" | +1 / −5 | merged |
 | [#3335](https://github.com/mesa/mesa/pull/3335) | Remove additional lines of code used for testing | +0 / −5 | merged |
 
-### Docs and navigation
+#### Docs and navigation
 
 Small but they were broken.
 
@@ -336,7 +819,7 @@ Small but they were broken.
 | [#2970](https://github.com/mesa/mesa/pull/2970) | Support capacity-aware cell selection | +47 / −25 | closed |
 | [#3723](https://github.com/mesa/mesa/pull/3723) | Testing RTD Dropdown Fix | +4 / −4 | closed |
 
-### Closed without merging — early proposals
+#### Closed without merging — early proposals
 
 My first weeks. An exception hierarchy proposed twice and declined, two example models that did not fit the examples policy, and one branch pushed under a placeholder title. Listed because leaving them out would misrepresent the ratio.
 
@@ -348,18 +831,16 @@ My first weeks. An exception hierarchy proposed twice and declined, two example 
 | [#3050](https://github.com/mesa/mesa/pull/3050) | Add Emperor's Dilemma to mesa-examples | +327 / −0 | closed |
 | [#3589](https://github.com/mesa/mesa/pull/3589) | check | +392 / −0 | closed |
 
----
+### 11.4 Issues and review
 
-## Issues and reviews
-
-Fifteen issues opened, fourteen of them closed:
+Fifteen issues opened, fourteen closed:
 
 | Issue | Title |
 |---|---|
-| [#2937](https://github.com/mesa/mesa/issues/2937) | Improper Redirection in Docs |
+| [#2937](https://github.com/mesa/mesa/issues/2937) | Improper redirection in docs |
 | [#3061](https://github.com/mesa/mesa/issues/3061) | Memory leak and invalidation bug in `Cell.get_neighborhood` caching |
 | [#3064](https://github.com/mesa/mesa/issues/3064) | Race condition in `SpaceRenderer._map_coordinates` for NetworkGrid |
-| [#3067](https://github.com/mesa/mesa/issues/3067) | `PropertyLayer` contains bloated wrappers that duplicate native NumPy functionality |
+| [#3067](https://github.com/mesa/mesa/issues/3067) | `PropertyLayer` contains wrappers duplicating native NumPy functionality |
 | [#3093](https://github.com/mesa/mesa/issues/3093) | `Grid2DMovingAgent` crashes on HexGrid due to static `DIRECTION_MAP` offsets |
 | [#3128](https://github.com/mesa/mesa/issues/3128) | Do we really need weakrefs in `AgentSet`? |
 | [#3190](https://github.com/mesa/mesa/issues/3190) | Reproducibility trap in `model.py` |
@@ -372,50 +853,34 @@ Fifteen issues opened, fourteen of them closed:
 | [#3548](https://github.com/mesa/mesa/issues/3548) | Replace `np.vstack` in `ContinuousSpace` with an array-growth approach |
 | [#3798](https://github.com/mesa/mesa/issues/3798) | Tracking issue for Action preconditions, preemption and continuation *(open)* |
 
-Most of those are bugs I hit while doing something else and wrote up rather than worked around. Several became PRs of mine; a few were fixed by other people.
+Additionally, [17 pull requests by other contributors reviewed](https://github.com/mesa/mesa/pulls?q=is%3Apr+reviewed-by%3Acodebreaker32+-author%3Acodebreaker32) and 40 commented on.
 
-I've also [reviewed 17 pull requests](https://github.com/mesa/mesa/pulls?q=is%3Apr+reviewed-by%3Acodebreaker32+-author%3Acodebreaker32) by other contributors and commented on 40. That's the part of open-source work that doesn't show up in a diff, and it's the part I'd want a maintainer to weigh.
-
-Every link on this page is a live query or a permanent URL, so none of it has to be taken on trust: [all 64 of my PRs](https://github.com/mesa/mesa/pulls?q=is%3Apr+author%3Acodebreaker32), [just the merged ones](https://github.com/mesa/mesa/pulls?q=is%3Apr+author%3Acodebreaker32+is%3Amerged), [my issues](https://github.com/mesa/mesa/issues?q=is%3Aissue+author%3Acodebreaker32).
+Verification links: [all pull requests](https://github.com/mesa/mesa/pulls?q=is%3Apr+author%3Acodebreaker32) · [merged only](https://github.com/mesa/mesa/pulls?q=is%3Apr+author%3Acodebreaker32+is%3Amerged) · [issues](https://github.com/mesa/mesa/issues?q=is%3Aissue+author%3Acodebreaker32)
 
 ---
 
-## What you actually get from `main` today
+## 12. Challenges and lessons
 
-Separate from the story, because these are different questions:
+**Benchmark results must be read in full.** The tensor backend's 78% improvement and its 148% initialisation regression appeared in the same CI comment. A performance claim is a distribution over workloads, including workloads that do not exercise the change at all.
 
-- `from mesa.experimental.states import ContinuousState, Threshold` works. 24 tests, experimental namespace, no semver guarantee.
-- `Action` takes `start_requirements` and `completion_requirements`, has `ActionState.FAILED` and `on_fail()`, and `Agent.should_interrupt` gates every preemption. **`Agent.on_idle` is not there yet** — that's #3833.
-- `EventList` compacts itself and `len()` on it is O(1). This is in stable `mesa/time/`, so it applies to every model that cancels events, not just mine.
-- `solara run mesa/examples/experimental/tram_model/app.py` runs the worked example.
-- **No narrative documentation.** The docstrings are thorough. The guide pages aren't written — that's section 5 of #3798 and it's still open.
+**The choice of benchmark model encodes an assumption about users.** Designing against Sugarscape made the rejected architecture appear necessary; the transit model the maintainers proposed did not.
 
-Other things I'd flag as unfinished: `_find_chained_rate` looks exactly one link deep, so a three-deep chain will under-integrate rather than raise, and no test covers that. Whether an agent should have exactly one action slot, and whether the action cluster belongs on core `Agent` or behind an experimental mixin, are both recorded as open questions rather than answered. And there's no general ODE support — that's the natural next piece, and it would cost `Threshold` its exact analytic crossing time in exchange for bisection on an integrator's output.
+**Declarative interfaces eliminate classes of error, not merely lines of code.** Replacing `set_limit()` and `rearm()` with an observable limit removed the failure mode in which a model omits the re-arm call and the threshold silently never fires again.
 
----
+**Stacked pull requests review faster than large ones.** [#3766](https://github.com/mesa/mesa/pull/3766) required 41 days and 24 inline comments. The action work, of comparable size, was split into three single-purpose pull requests tracked by a public issue, each merged within a fortnight. Enabling changes were extracted proactively for the same reason.
 
-## What I'd tell myself in June
-
-**Read the whole benchmark, not the column you were hoping for.** The 78% win was real and so was the 148% regression, and they were in the same CI comment. A performance claim isn't a number, it's a distribution over workloads — including the workloads that don't use your code at all.
-
-**Pick the model that will hurt you.** I designed against Sugarscape because it made the architecture look necessary. The model you validate against silently encodes an assumption about who your users are.
-
-**Declarative beats imperative when the alternative is an API someone can forget to call.** `set_limit()` and `rearm()` weren't wrong exactly. They were just a way to have a bug.
-
-**Stack small PRs.** #3766 took 41 days and 24 inline comments. The action work — comparable code, split into three PRs with one idea each, stacked, tracked by a public issue — went from opened to merged in under two weeks apiece.
-
-**Writing the design down first isn't overhead.** The baseline evaluation cost about a week and produced the one sentence the whole project turned on. I wouldn't have found that framing by writing code.
+**Writing the design down first was not overhead.** The baseline evaluation cost approximately one week and produced the framing on which the entire project rested.
 
 ---
 
-## Thanks
+## 13. Acknowledgements
 
-**[Jan Kwakkel](https://github.com/quaquel)** reviewed nearly all of this, and two of his comments changed the project rather than the code: naming the three simulation world-views turned my list of complaints into a diagnosis, and refusing the `DecisionSystem` kept a rules engine out of a framework that shouldn't have one. He also asked for the evidence behind a magic constant, which is how `COMPACTION_RATIO` ended up measured instead of guessed.
+**[Jan Kwakkel](https://github.com/quaquel)** reviewed the great majority of this work. Two contributions altered the project rather than the code: introducing the simulation world-view taxonomy, which converted a list of complaints into a diagnosis; and rejecting the `DecisionSystem`, which kept a rules engine out of a framework that should not contain one. The request for evidence behind a magic constant is why `COMPACTION_RATIO` was measured rather than chosen.
 
-**[Ewout ter Hoeven](https://github.com/EwoutH)** opened the discussions this grew out of and wrote the `Action` primitive I built on. He's also the reason the tensor backend died at two weeks instead of two months.
+**[Ewout ter Hoeven](https://github.com/EwoutH)** opened the discussions this project developed from and authored the `Action` primitive it extends. His review is the reason the tensor backend was abandoned after two weeks rather than two months.
 
-**[Jackie Kazil](https://github.com/jackiekazil)** and **[Tom Pike](https://github.com/tpike3)** reviewed and merged much of the surrounding work, and pushed back on the examples reorganisation until the docs actually built.
+**[Jackie Kazil](https://github.com/jackiekazil)** and **[Tom Pike](https://github.com/tpike3)** reviewed and merged much of the surrounding work.
 
 ---
 
-*Every figure here is generated by [`make_figures.py`](make_figures.py) in this repo — figures 1 and 2 by running the merged tram example and instrumenting the threshold callbacks, figure 3 from the numbers reported in #3800, figure 4 from the CI benchmark bot on #3754. The benchmark figures are my own measurements on one machine; treat them as the author's numbers on a stated workload, not an independent audit.*
+*All figures in this document are generated by [`make_figures.py`](make_figures.py). Figures 1 and 2 are produced by executing the merged tram example and instrumenting its threshold callbacks; figure 3 plots the measurements reported in [#3800](https://github.com/mesa/mesa/pull/3800); figure 4 plots the CI benchmark output on [#3754](https://github.com/mesa/mesa/pull/3754).*
