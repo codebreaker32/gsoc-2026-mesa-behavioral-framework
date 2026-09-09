@@ -9,7 +9,7 @@
 | **Upstream repository** | `mesa/mesa` |
 | **Primary deliverable** | `mesa.experimental.states` — `ContinuousState` and `Threshold` |
 | **Also extends** | `mesa.experimental.actions` and the event list in `mesa.time` |
-| **Status** | Core API merged; `Agent.on_idle` under review |
+| **Status** | All pull requests merged |
 | **Tracking issue** | [#3798](https://github.com/mesa/mesa/issues/3798) |
 
 ---
@@ -20,7 +20,7 @@ Mesa 4 advances simulated time through a single event list, but its modelling AP
 
 This project adds a declarative alternative. A quantity states its rate of change once; Mesa stores it as a trajectory and extrapolates it exactly on read. A `Threshold` solves in closed form for the time at which that trajectory reaches a limit and schedules a single event at that instant. Transition detection becomes exact rather than quantised to the tick grid, and its cost scales with the number of transitions rather than the number of ticks.
 
-A second strand extends Mesa's existing `Action` primitive with preconditions, a failure state, priority-based preemption and an idle-wake hook. A third fixes the event-list growth that the threshold design exposes.
+A second strand extends Mesa's existing `Action` primitive with preconditions, a failure state, priority-based preemption and an idle-wake hook. A third fixes the event-list growth that the threshold design exposes. All of it is merged and available on `main`.
 
 ---
 
@@ -367,7 +367,7 @@ model.kettle.cups_made        # 3
 
 The kettle has no `step()`. Between `switch_on()` and `boiled()` the model holds exactly one scheduled event, and `temperature` is correct if read at any instant in between — it is never sampled.
 
-> **Note.** `Threshold` and `ContinuousState` are merged and available. `Agent.on_idle` is not: it is [#3833](https://github.com/mesa/mesa/pull/3833), still under review. Until that lands, the second wake source in this example must be written by scheduling the next heating cycle from `Steep.on_complete()` directly.
+> **Note.** Everything in this example is merged and available on `main`. `on_idle` landed in [#3833](https://github.com/mesa/mesa/pull/3833) on 7 September 2026.
 
 ---
 
@@ -509,7 +509,7 @@ sheep.interrupt_for(Forage(sheep, priority=1.0))    # False — flee continues
 
 The default comparison is `>=` rather than `>`. Priorities default to `0.0`, so a strict `>` would silently prevent every existing model from interrupting at all; it broke three tests already present on `main`. With `>=` the hook is a no-op for any model written before it.
 
-`on_idle` is dispatched as a zero-delay `Priority.LOW` event rather than called synchronously from `_do_complete`. This ensures a zero-duration action started from within `on_idle` cannot recurse, and that every agent finishing at time *t* decides only after all completions at *t* have run. At most one wake is delivered per agent per model time; endings that coalesce report the latest as `previous`. `Agent.remove()` cancels a pending wake, so a removed agent never wakes.
+`on_idle` is dispatched as a zero-delay `Priority.LOW` event rather than called synchronously from `_do_complete`. This ensures a zero-duration action started from within `on_idle` cannot recurse, and that every agent finishing at time *t* decides only after all completions at *t* have run. At most one wake is delivered per agent per model time; endings that coalesce report the latest as `previous`, and a suppressed repeat is logged at `DEBUG` rather than silently dropped. `Agent.remove()` cancels a pending wake, so a removed agent never wakes.
 
 ```python
 class Worker(Agent):
@@ -812,7 +812,7 @@ Two of the three originally proposed components therefore did not ship under the
 
 - `from mesa.experimental.states import ContinuousState, Threshold` is available. Experimental namespace; no semantic-versioning guarantee.
 - `Action` accepts `start_requirements` and `completion_requirements`, exposes `ActionState.FAILED` and `on_fail()`, and `Agent.should_interrupt` gates every preemption.
-- **`Agent.on_idle` is not yet merged** — see [#3833](https://github.com/mesa/mesa/pull/3833).
+- `Agent.on_idle(previous)` is called whenever an action ends and nothing replaces it, dispatched as a deferred `Priority.LOW` event. A repeat wake at the same `model.time` is suppressed and logged at `DEBUG`.
 - `EventList` compacts adaptively and `len()` is O(1). This is in stable `mesa/time/` and applies to every model that cancels events.
 - `solara run mesa/examples/experimental/tram_model/app.py` runs the worked example.
 - **No narrative documentation exists.** Docstrings are complete; the guide pages are not written.
@@ -825,7 +825,6 @@ Three pull requests touch stable modules (`mesa/time/events.py`, `mesa/agent.py`
 
 | Item | Status |
 |---|---|
-| [#3833](https://github.com/mesa/mesa/pull/3833) — `Agent.on_idle` | Open, awaiting first review. Stacked on #3805. |
 | Narrative documentation for both wake sources | Not started (§5 of [#3798](https://github.com/mesa/mesa/issues/3798)) |
 | User-space "resume the remainder" recipes | Not started |
 | Task-driven example under `mesa/examples/experimental/` | Not started |
@@ -854,17 +853,17 @@ Three pull requests touch stable modules (`mesa/time/events.py`, `mesa/agent.py`
 | [#3800](https://github.com/mesa/mesa/pull/3800) | Adaptive event-list compaction and O(1) `__len__` | merged |
 | [#3801](https://github.com/mesa/mesa/pull/3801) | Requirement lists and an `ActionState.FAILED` path | merged |
 | [#3805](https://github.com/mesa/mesa/pull/3805) | `Agent.should_interrupt`, giving `Action.priority` effect | merged |
-| [#3833](https://github.com/mesa/mesa/pull/3833) | `Agent.on_idle` as a deferred low-priority wake | **open** |
+| [#3833](https://github.com/mesa/mesa/pull/3833) | `Agent.on_idle` as a deferred low-priority wake | merged |
 
 ### 11.2 Tracking issue
 
-The action strand is tracked in [#3798](https://github.com/mesa/mesa/issues/3798), opened 13 August: five sections, fourteen checkboxes, seven complete.
+The action strand is tracked in [#3798](https://github.com/mesa/mesa/issues/3798), opened 13 August: five sections, fourteen checkboxes. Sections 1 to 4 are complete; section 5, documentation and examples, is not.
 
 | Section | Covers | Status |
 |---|---|---|
 | 1. Event list — `mesa.time` | Adaptive compaction, tombstone counter, O(1) `__len__` | Complete — [#3800](https://github.com/mesa/mesa/pull/3800) |
 | 2. Action primitives | Requirement lists, `ActionState.FAILED`, `on_fail()`, give `priority` effect | Complete — [#3801](https://github.com/mesa/mesa/pull/3801), [#3805](https://github.com/mesa/mesa/pull/3805) |
-| 3. Wake contract | `Agent.on_idle`, deferred dispatch, same-time coalescing, cancel on `remove()` | Under review — [#3833](https://github.com/mesa/mesa/pull/3833) |
+| 3. Wake contract | `Agent.on_idle`, deferred dispatch, same-time coalescing, cancel on `remove()` | Complete — [#3833](https://github.com/mesa/mesa/pull/3833) |
 | 4. Preemption | `Agent.should_interrupt` | Complete — [#3805](https://github.com/mesa/mesa/pull/3805) |
 | 5. Docs and examples | Both wake sources documented, resume recipes, task-driven example | Not started |
 
